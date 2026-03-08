@@ -1,6 +1,6 @@
 """Fixed infrastructure for the robotics autoresearch loop.
 
-Downloads the Unitree H1 humanoid model, provides simulation helpers,
+Downloads the Unitree G1 humanoid model, provides simulation helpers,
 and evaluates MPC controllers. This file is READ-ONLY to the agent.
 """
 
@@ -15,56 +15,64 @@ import numpy as np
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-SIM_DURATION = 30.0        # seconds of simulation
-SIM_DT = 0.002             # physics timestep (500 Hz)
-CONTROL_DT = 0.02          # control rate (50 Hz)
-CONTROL_SUBSTEPS = 10      # physics steps per control step
-N_CONTROL_STEPS = 1500     # total control steps per evaluation
-
 CACHE_DIR = Path.home() / ".cache" / "robotics-autoresearch"
 
-# ── H1 model download ─────────────────────────────────────────────────────────
+# ── G1 model download ─────────────────────────────────────────────────────────
 
 _MENAGERIE_BASE = (
     "https://raw.githubusercontent.com/google-deepmind/mujoco_menagerie"
-    "/main/unitree_h1"
+    "/main/unitree_g1"
 )
 
-_H1_FILES = [
-    "h1.xml",
+_G1_FILES = [
+    "g1.xml",
     "scene.xml",
     # STL mesh assets
-    "assets/left_ankle_link.stl",
-    "assets/left_hip_pitch_link.stl",
-    "assets/left_hip_roll_link.stl",
-    "assets/left_hip_yaw_link.stl",
-    "assets/left_knee_link.stl",
-    "assets/logo_link.stl",
-    "assets/pelvis.stl",
-    "assets/right_ankle_link.stl",
-    "assets/right_hip_pitch_link.stl",
-    "assets/right_hip_roll_link.stl",
-    "assets/right_hip_yaw_link.stl",
-    "assets/right_knee_link.stl",
-    "assets/torso_link.stl",
-    "assets/left_elbow_link.stl",
-    "assets/left_shoulder_pitch_link.stl",
-    "assets/left_shoulder_roll_link.stl",
-    "assets/left_shoulder_yaw_link.stl",
-    "assets/right_elbow_link.stl",
-    "assets/right_shoulder_pitch_link.stl",
-    "assets/right_shoulder_roll_link.stl",
-    "assets/right_shoulder_yaw_link.stl",
+    "assets/pelvis.STL",
+    "assets/pelvis_contour_link.STL",
+    "assets/left_hip_pitch_link.STL",
+    "assets/left_hip_roll_link.STL",
+    "assets/left_hip_yaw_link.STL",
+    "assets/left_knee_link.STL",
+    "assets/left_ankle_pitch_link.STL",
+    "assets/left_ankle_roll_link.STL",
+    "assets/right_hip_pitch_link.STL",
+    "assets/right_hip_roll_link.STL",
+    "assets/right_hip_yaw_link.STL",
+    "assets/right_knee_link.STL",
+    "assets/right_ankle_pitch_link.STL",
+    "assets/right_ankle_roll_link.STL",
+    "assets/waist_yaw_link_rev_1_0.STL",
+    "assets/waist_roll_link_rev_1_0.STL",
+    "assets/torso_link_rev_1_0.STL",
+    "assets/logo_link.STL",
+    "assets/head_link.STL",
+    "assets/left_shoulder_pitch_link.STL",
+    "assets/left_shoulder_roll_link.STL",
+    "assets/left_shoulder_yaw_link.STL",
+    "assets/left_elbow_link.STL",
+    "assets/left_wrist_roll_link.STL",
+    "assets/left_wrist_pitch_link.STL",
+    "assets/left_wrist_yaw_link.STL",
+    "assets/left_rubber_hand.STL",
+    "assets/right_shoulder_pitch_link.STL",
+    "assets/right_shoulder_roll_link.STL",
+    "assets/right_shoulder_yaw_link.STL",
+    "assets/right_elbow_link.STL",
+    "assets/right_wrist_roll_link.STL",
+    "assets/right_wrist_pitch_link.STL",
+    "assets/right_wrist_yaw_link.STL",
+    "assets/right_rubber_hand.STL",
 ]
 
 
-def download_h1_model(max_retries: int = 3) -> Path:
-    """Download H1 XML + mesh assets from mujoco_menagerie (idempotent)."""
-    model_dir = CACHE_DIR / "unitree_h1"
+def download_g1_model(max_retries: int = 3) -> Path:
+    """Download G1 XML + mesh assets from mujoco_menagerie (idempotent)."""
+    model_dir = CACHE_DIR / "unitree_g1"
     assets_dir = model_dir / "assets"
     assets_dir.mkdir(parents=True, exist_ok=True)
 
-    for fname in _H1_FILES:
+    for fname in _G1_FILES:
         dest = model_dir / fname
         if dest.exists():
             continue
@@ -85,14 +93,17 @@ def download_h1_model(max_retries: int = 3) -> Path:
 # ── Simulation helpers ─────────────────────────────────────────────────────────
 
 def make_sim() -> tuple[mujoco.MjModel, mujoco.MjData]:
-    """Load the H1 scene and reset to standing pose (home keyframe)."""
-    model_dir = CACHE_DIR / "unitree_h1"
+    """Load the G1 scene and reset to standing pose (home keyframe).
+
+    NOTE: The caller should set model.opt.timestep if a non-default
+    timestep is desired (see SIM_DT in mpc.py).
+    """
+    model_dir = CACHE_DIR / "unitree_g1"
     scene_path = model_dir / "scene.xml"
     if not scene_path.exists():
-        download_h1_model()
+        download_g1_model()
 
     model = mujoco.MjModel.from_xml_path(str(scene_path))
-    model.opt.timestep = SIM_DT
     data = mujoco.MjData(model)
 
     # Reset to home keyframe (standing pose)
@@ -101,6 +112,45 @@ def make_sim() -> tuple[mujoco.MjModel, mujoco.MjData]:
     mujoco.mj_forward(model, data)
 
     return model, data
+
+
+def compute_grav_comp(model: mujoco.MjModel) -> np.ndarray:
+    """Compute gravity compensation generalized forces for the home keyframe.
+
+    Returns (nu,) array of generalized forces that counteract gravity when
+    the robot is at the home keyframe with zero velocity and acceleration.
+
+    For position-controlled actuators (like G1), the ctrl offset needed is:
+        ctrl_offset = grav_comp / kp
+    where kp is the actuator's position gain.
+    """
+    data = mujoco.MjData(model)
+    mujoco.mj_resetDataKeyframe(model, data, 0)
+    data.qvel[:] = 0
+    data.qacc[:] = 0
+    mujoco.mj_inverse(model, data)
+
+    torques = np.zeros(model.nu)
+    for i in range(model.nu):
+        jnt_id = model.actuator_trnid[i, 0]
+        dof = model.joint(jnt_id).dofadr[0]
+        torques[i] = data.qfrc_inverse[dof]
+    return torques
+
+
+def get_home_positions(model: mujoco.MjModel) -> np.ndarray:
+    """Return the home keyframe joint positions for actuated joints (nu,).
+
+    For position-controlled actuators, these are the natural nominal
+    ctrl targets (commanding home positions holds the standing pose).
+    """
+    home = np.zeros(model.nu)
+    key_qpos = model.key_qpos[0]
+    for i in range(model.nu):
+        jnt_id = model.actuator_trnid[i, 0]
+        qpos_adr = model.joint(jnt_id).qposadr[0]
+        home[i] = key_qpos[qpos_adr]
+    return home
 
 
 def get_initial_state(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:
@@ -141,17 +191,18 @@ def parallel_rollout(
         data_list: Per-thread MjData list (from make_data_list).
         initial_state: Full physics state array.
         control_seq: Control sequences, shape (nbatch, horizon, nu).
-            Each control is applied for CONTROL_SUBSTEPS physics steps.
-        nstep: Number of physics steps to simulate per trajectory
-            (= horizon * CONTROL_SUBSTEPS).
+        nstep: Number of physics steps to simulate per trajectory.
+            The control_substeps is inferred as nstep // horizon.
 
     Returns:
         State trajectories, shape (nbatch, nstep, nstate).
     """
     nbatch = control_seq.shape[0]
+    horizon = control_seq.shape[1]
+    control_substeps = nstep // horizon
 
-    # Repeat each control for CONTROL_SUBSTEPS physics steps
-    ctrl_expanded = np.repeat(control_seq, CONTROL_SUBSTEPS, axis=1)
+    # Repeat each control for control_substeps physics steps
+    ctrl_expanded = np.repeat(control_seq, control_substeps, axis=1)
 
     # Tile initial state for all batches
     initial_states = np.tile(initial_state, (nbatch, 1))
@@ -174,12 +225,26 @@ def parallel_rollout(
 
 # ── Evaluation ─────────────────────────────────────────────────────────────────
 
-def evaluate_speed(model: mujoco.MjModel, data: mujoco.MjData) -> float:
-    """Run MPC for SIM_DURATION seconds, return average forward speed (m/s).
+def evaluate_speed(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    n_steps: int | None = None,
+) -> float:
+    """Run MPC for n_steps control steps, return average forward speed (m/s).
 
-    Imports mpc.get_action at call time so the agent's latest code is used.
+    Imports timing constants and get_action from mpc at call time so the
+    agent's latest code is always used.
+
+    Args:
+        model: MjModel instance.
+        data: MjData instance.
+        n_steps: Number of control steps. Defaults to N_CONTROL_STEPS from mpc.
+            Use a smaller value (e.g., 250 = 5s) for fast screening.
     """
-    from mpc import get_action
+    from mpc import get_action, CONTROL_DT, CONTROL_SUBSTEPS, N_CONTROL_STEPS
+
+    if n_steps is None:
+        n_steps = N_CONTROL_STEPS
 
     # Reset to home keyframe
     if model.nkey > 0:
@@ -188,14 +253,14 @@ def evaluate_speed(model: mujoco.MjModel, data: mujoco.MjData) -> float:
 
     initial_x = data.qpos[0]
 
-    for step in range(N_CONTROL_STEPS):
+    for step in range(n_steps):
         action = get_action(model, data)
         data.ctrl[:] = action
         for _ in range(CONTROL_SUBSTEPS):
             mujoco.mj_step(model, data)
 
     final_x = data.qpos[0]
-    elapsed = N_CONTROL_STEPS * CONTROL_DT
+    elapsed = n_steps * CONTROL_DT
     avg_speed = (final_x - initial_x) / elapsed
 
     return avg_speed
@@ -204,11 +269,24 @@ def evaluate_speed(model: mujoco.MjModel, data: mujoco.MjData) -> float:
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("Downloading Unitree H1 model...")
-    model_dir = download_h1_model()
-    print(f"H1 model ready at: {model_dir}")
+    print("Downloading Unitree G1 model...")
+    model_dir = download_g1_model()
+    print(f"G1 model ready at: {model_dir}")
 
     model, data = make_sim()
     print(f"Model loaded: {model.nq} qpos, {model.nv} qvel, {model.nu} actuators")
-    print(f"Simulation: {SIM_DURATION}s at {1/SIM_DT:.0f} Hz physics, {1/CONTROL_DT:.0f} Hz control")
-    print("Ready for autoresearch.")
+
+    # Show utility info
+    gc = compute_grav_comp(model)
+    home = get_home_positions(model)
+    print(f"\nGravity comp forces: {np.round(gc, 1)}")
+    print(f"Home positions: {np.round(home, 2)}")
+    print(f"\nActuator info:")
+    for i in range(model.nu):
+        name = model.actuator(i).name
+        jnt_id = model.actuator_trnid[i, 0]
+        lo, hi = model.jnt_range[jnt_id]
+        print(f"  {name:35s}  ctrl=[{model.actuator_ctrlrange[i,0]:7.2f}, {model.actuator_ctrlrange[i,1]:7.2f}]  "
+              f"joint=[{lo:6.3f}, {hi:6.3f}]  home={home[i]:6.3f}  gc={gc[i]:7.2f}")
+
+    print("\nReady for autoresearch.")

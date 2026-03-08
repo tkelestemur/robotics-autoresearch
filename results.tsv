@@ -1,2 +1,2 @@
 commit	avg_speed_mps	wall_time_s	status	description
-7fb7a74	-0.030	35.7	keep	baseline MPPI with gravity comp nominal and per-actuator noise scaling
+none	1.246	84.4	keep	baseline MPPI with home position nominal, G1 position control
