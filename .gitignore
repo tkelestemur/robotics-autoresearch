@@ -8,5 +8,4 @@ build/
 *.so
 *.dylib
 run.log
-results.tsv
 .ipynb_checkpoints/
