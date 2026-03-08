@@ -1,2 +1,2 @@
 commit	avg_speed_mps	wall_time_s	status	description
-none	1.246	84.4	keep	baseline MPPI with home position nominal, G1 position control
+d66116e	1.246	84.4	keep	baseline MPPI with home position nominal, G1 position control
