@@ -1,0 +1,19 @@
+[project]
+name = "robotics-autoresearch"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "mujoco>=3.2.0",
+    "numpy",
+    "matplotlib",
+    "pandas",
+    "jupyter",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+only-include = ["prepare.py", "mpc.py"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
