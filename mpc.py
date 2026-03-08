@@ -13,6 +13,7 @@ import numpy as np
 from prepare import (
     CONTROL_DT,
     CONTROL_SUBSTEPS,
+    N_CONTROL_STEPS,
     make_data_list,
     make_sim,
     get_initial_state,
@@ -23,14 +24,14 @@ from prepare import (
 
 HORIZON = 10          # control steps lookahead (0.2s at 50 Hz)
 NUM_SAMPLES = 128     # number of parallel trajectory samples
-TEMPERATURE = 0.1     # MPPI inverse temperature (lower = more greedy)
-NOISE_STD = 0.3       # std of Gaussian control perturbations
+TEMPERATURE = 0.5     # MPPI inverse temperature (lower = more greedy)
+NOISE_SCALE = 0.1     # noise std as fraction of each actuator's range
 
 # Cost weights
 SPEED_WEIGHT = 5.0    # reward for forward velocity
 HEIGHT_WEIGHT = 2.0   # penalty for deviating from target height
 UPRIGHT_WEIGHT = 1.0  # penalty for not being upright
-CTRL_WEIGHT = 0.01    # penalty for control effort
+CTRL_WEIGHT = 0.0001  # penalty for control effort
 
 # Target values
 TARGET_HEIGHT = 1.0   # desired torso height (m)
@@ -38,17 +39,6 @@ FALL_HEIGHT = 0.3     # below this = fallen
 
 # Parallelism
 NTHREAD = os.cpu_count() or 4
-
-# ── State indexing helpers ─────────────────────────────────────────────────────
-# H1 state layout: qpos (nq) then qvel (nv) in full physics state
-# qpos[0:3] = x, y, z position of torso
-# qpos[3:7] = quaternion (w, x, y, z) orientation of torso
-# qvel[0:3] = linear velocity (vx, vy, vz) in world frame
-# qvel[3:6] = angular velocity
-
-
-def _get_nq_nv(model: mujoco.MjModel) -> tuple[int, int]:
-    return model.nq, model.nv
 
 
 # ── Cost function ──────────────────────────────────────────────────────────────
@@ -70,141 +60,208 @@ def compute_trajectory_costs(
     Returns:
         costs: (nbatch,) total cost per trajectory.
     """
-    nbatch = state_traj.shape[0]
     nstep = state_traj.shape[1]
 
-    # Extract positions and velocities from state
-    # State layout: [qpos (nq), qvel (nv), ...]
-    qpos = state_traj[:, :, :nq]       # (nbatch, nstep, nq)
-    qvel = state_traj[:, :, nq:nq+nv]  # (nbatch, nstep, nv)
+    qpos = state_traj[:, :, :nq]
+    qvel = state_traj[:, :, nq:nq+nv]
 
-    # Sample at control rate (every CONTROL_SUBSTEPS physics steps)
+    # Sample at control rate
     ctrl_indices = np.arange(CONTROL_SUBSTEPS - 1, nstep, CONTROL_SUBSTEPS)
-    qpos_ctrl = qpos[:, ctrl_indices, :]  # (nbatch, horizon, nq)
-    qvel_ctrl = qvel[:, ctrl_indices, :]  # (nbatch, horizon, nv)
+    qpos_ctrl = qpos[:, ctrl_indices, :]
+    qvel_ctrl = qvel[:, ctrl_indices, :]
 
-    # Forward velocity reward (negative cost for forward speed)
-    vx = qvel_ctrl[:, :, 0]  # (nbatch, horizon)
-    speed_cost = -SPEED_WEIGHT * vx  # reward forward velocity
+    # Forward velocity reward
+    vx = qvel_ctrl[:, :, 0]
+    speed_cost = -SPEED_WEIGHT * vx
 
-    # Height penalty: keep torso near TARGET_HEIGHT
-    z = qpos_ctrl[:, :, 2]  # (nbatch, horizon)
+    # Height penalty
+    z = qpos_ctrl[:, :, 2]
     height_cost = HEIGHT_WEIGHT * (z - TARGET_HEIGHT) ** 2
 
-    # Upright penalty: quaternion w component should be close to 1
-    qw = qpos_ctrl[:, :, 3]  # (nbatch, horizon)
+    # Upright penalty
+    qw = qpos_ctrl[:, :, 3]
     upright_cost = UPRIGHT_WEIGHT * (1.0 - qw ** 2)
 
     # Control effort
-    ctrl_cost = CTRL_WEIGHT * np.sum(control_seq ** 2, axis=-1)  # (nbatch, horizon)
+    ctrl_cost = CTRL_WEIGHT * np.sum(control_seq ** 2, axis=-1)
 
-    # Per-step cost
-    step_cost = speed_cost + height_cost + upright_cost + ctrl_cost  # (nbatch, horizon)
+    step_cost = speed_cost + height_cost + upright_cost + ctrl_cost
 
-    # Fall penalty: large cost if robot falls
-    min_height = np.min(z, axis=1)  # (nbatch,)
+    # Fall penalty
+    min_height = np.min(z, axis=1)
     fall_penalty = np.where(min_height < FALL_HEIGHT, 1000.0, 0.0)
 
-    # Total cost: sum over horizon + fall penalty
-    total_cost = np.sum(step_cost, axis=1) + fall_penalty  # (nbatch,)
-
-    return total_cost
+    return np.sum(step_cost, axis=1) + fall_penalty
 
 
 # ── MPPI Controller ────────────────────────────────────────────────────────────
 
-# Persistent state across calls
+SEED = 42
+
 _nominal: np.ndarray | None = None
+_grav_comp: np.ndarray | None = None
+_noise_std: np.ndarray | None = None
 _data_list: list | None = None
+_rng: np.random.Generator | None = None
+
+
+def _compute_grav_comp(model: mujoco.MjModel) -> np.ndarray:
+    """Compute gravity compensation torques for the home keyframe."""
+    data = mujoco.MjData(model)
+    mujoco.mj_resetDataKeyframe(model, data, 0)
+    data.qvel[:] = 0
+    data.qacc[:] = 0
+    mujoco.mj_inverse(model, data)
+
+    torques = np.zeros(model.nu)
+    for i in range(model.nu):
+        jnt_id = model.actuator_trnid[i, 0]
+        dof = model.joint(jnt_id).dofadr[0]
+        torques[i] = data.qfrc_inverse[dof]
+    return torques
 
 
 def get_action(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:
     """MPPI controller: called at each control step by evaluate_speed().
 
-    Returns the action (nu,) to apply for the next control step.
+    Returns the torque action (nu,) to apply for the next control step.
     """
-    global _nominal, _data_list
+    global _nominal, _grav_comp, _noise_std, _data_list, _rng
 
     nu = model.nu
-    nq, nv = _get_nq_nv(model)
+    nq = model.nq
+    nv = model.nv
+    ctrl_range = model.actuator_ctrlrange
+    lo = ctrl_range[:, 0]
+    hi = ctrl_range[:, 1]
 
-    # Initialize nominal trajectory and thread data on first call
+    # Initialize on first call
+    if _rng is None:
+        _rng = np.random.default_rng(SEED)
+    if _grav_comp is None:
+        _grav_comp = _compute_grav_comp(model)
+    if _noise_std is None:
+        _noise_std = NOISE_SCALE * (hi - lo)
     if _nominal is None or _nominal.shape != (HORIZON, nu):
-        _nominal = np.zeros((HORIZON, nu), dtype=np.float64)
+        _nominal = np.tile(_grav_comp, (HORIZON, 1))
     if _data_list is None:
         _data_list = make_data_list(model, NTHREAD)
 
-    # Get current state
     current_state = get_initial_state(model, data)
 
-    # Sample noise
-    noise = np.random.randn(NUM_SAMPLES, HORIZON, nu) * NOISE_STD
+    # Sample noise scaled per actuator
+    noise = _rng.standard_normal((NUM_SAMPLES, HORIZON, nu)) * _noise_std
 
-    # Create candidate control sequences
-    candidates = _nominal[np.newaxis, :, :] + noise  # (NUM_SAMPLES, HORIZON, nu)
+    # Candidate torque sequences
+    candidates = _nominal[np.newaxis, :, :] + noise
+    candidates = np.clip(candidates, lo, hi)
 
-    # Clip to actuator limits
-    ctrl_range = model.actuator_ctrlrange
-    if ctrl_range is not None and len(ctrl_range) > 0:
-        lo = ctrl_range[:, 0]
-        hi = ctrl_range[:, 1]
-        candidates = np.clip(candidates, lo, hi)
-
-    # Roll out trajectories in parallel
+    # Roll out
     nstep = HORIZON * CONTROL_SUBSTEPS
     state_traj = parallel_rollout(model, _data_list, current_state, candidates, nstep)
 
     # Compute costs
     costs = compute_trajectory_costs(state_traj, candidates, nq, nv)
 
-    # MPPI weights: softmax(-costs / temperature)
-    costs_shifted = costs - np.min(costs)  # numerical stability
+    # MPPI weights
+    costs_shifted = costs - np.min(costs)
     weights = np.exp(-costs_shifted / TEMPERATURE)
     weights /= np.sum(weights) + 1e-10
 
-    # Weighted update of nominal trajectory
+    # Update nominal
     weighted_noise = np.sum(weights[:, np.newaxis, np.newaxis] * noise, axis=0)
     _nominal = _nominal + weighted_noise
-
-    # Clip nominal to actuator limits
-    if ctrl_range is not None and len(ctrl_range) > 0:
-        _nominal = np.clip(_nominal, lo, hi)
+    _nominal = np.clip(_nominal, lo, hi)
 
     # Extract first action
     action = _nominal[0].copy()
 
-    # Shift horizon: drop first, append zero
+    # Shift horizon, fill with gravity comp
     _nominal = np.roll(_nominal, -1, axis=0)
-    _nominal[-1] = 0.0
+    _nominal[-1] = _grav_comp.copy()
 
     return action
+
+
+# ── Visualization ─────────────────────────────────────────────────────────────
+
+def run_visualized(model: mujoco.MjModel, data: mujoco.MjData) -> None:
+    """Run MPC with the MuJoCo native viewer (real-time visualization)."""
+    import mujoco.viewer
+
+    if model.nkey > 0:
+        mujoco.mj_resetDataKeyframe(model, data, 0)
+    mujoco.mj_forward(model, data)
+
+    initial_x = data.qpos[0]
+
+    with mujoco.viewer.launch_passive(model, data) as viewer:
+        start = time.time()
+        for step in range(N_CONTROL_STEPS):
+            if not viewer.is_running():
+                break
+            step_start = time.time()
+
+            action = get_action(model, data)
+            data.ctrl[:] = action
+            for _ in range(CONTROL_SUBSTEPS):
+                mujoco.mj_step(model, data)
+            viewer.sync()
+
+            elapsed = time.time() - step_start
+            sleep_time = CONTROL_DT - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+        wall_time = time.time() - start
+        final_x = data.qpos[0]
+        avg_speed = (final_x - initial_x) / (N_CONTROL_STEPS * CONTROL_DT)
+        print(f"\n---")
+        print(f"avg_speed_mps:    {avg_speed:.6f}")
+        print(f"total_seconds:    {wall_time:.1f}")
+
+        while viewer.is_running():
+            time.sleep(0.1)
 
 
 # ── Main: run evaluation ──────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    from prepare import evaluate_speed
+    import argparse
 
-    # Reset controller state
+    parser = argparse.ArgumentParser(description="MPPI controller for H1")
+    parser.add_argument("--viz", action="store_true",
+                        help="Launch MuJoCo viewer for real-time visualization")
+    args = parser.parse_args()
+
     _nominal = None
+    _grav_comp = None
+    _noise_std = None
     _data_list = None
+    _rng = None
 
     print("Setting up simulation...")
     model, data = make_sim()
 
-    print(f"Running MPPI controller for 30s...")
     print(f"  horizon={HORIZON}, samples={NUM_SAMPLES}, "
-          f"temperature={TEMPERATURE}, noise_std={NOISE_STD}")
-    print(f"  threads={NTHREAD}")
+          f"temperature={TEMPERATURE}, noise_scale={NOISE_SCALE}")
 
-    t0 = time.time()
-    avg_speed = evaluate_speed(model, data)
-    wall_time = time.time() - t0
+    if args.viz:
+        print("Launching viewer...")
+        run_visualized(model, data)
+    else:
+        from prepare import evaluate_speed
 
-    print(f"\n---")
-    print(f"avg_speed_mps:    {avg_speed:.6f}")
-    print(f"total_seconds:    {wall_time:.1f}")
-    print(f"horizon:          {HORIZON}")
-    print(f"num_samples:      {NUM_SAMPLES}")
-    print(f"temperature:      {TEMPERATURE}")
-    print(f"noise_std:        {NOISE_STD}")
+        print(f"Running MPPI controller for 30s (threads={NTHREAD})...")
+
+        t0 = time.time()
+        avg_speed = evaluate_speed(model, data)
+        wall_time = time.time() - t0
+
+        print(f"\n---")
+        print(f"avg_speed_mps:    {avg_speed:.6f}")
+        print(f"total_seconds:    {wall_time:.1f}")
+        print(f"horizon:          {HORIZON}")
+        print(f"num_samples:      {NUM_SAMPLES}")
+        print(f"temperature:      {TEMPERATURE}")
+        print(f"noise_scale:      {NOISE_SCALE}")

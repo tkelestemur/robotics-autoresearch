@@ -4,7 +4,6 @@ Downloads the Unitree H1 humanoid model, provides simulation helpers,
 and evaluates MPC controllers. This file is READ-ONLY to the agent.
 """
 
-import os
 import time
 import urllib.request
 import urllib.error
@@ -150,12 +149,9 @@ def parallel_rollout(
         State trajectories, shape (nbatch, nstep, nstate).
     """
     nbatch = control_seq.shape[0]
-    horizon = control_seq.shape[1]
-    nu = control_seq.shape[2]
 
     # Repeat each control for CONTROL_SUBSTEPS physics steps
     ctrl_expanded = np.repeat(control_seq, CONTROL_SUBSTEPS, axis=1)
-    # ctrl_expanded shape: (nbatch, nstep, nu)
 
     # Tile initial state for all batches
     initial_states = np.tile(initial_state, (nbatch, 1))
