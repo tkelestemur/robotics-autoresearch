@@ -32,7 +32,7 @@ N_CONTROL_STEPS = int(round(SIM_DURATION / CONTROL_DT))
 # ── MPPI Hyperparameters ─────────────────────────────────────────────────────
 
 HORIZON = 28          # control steps lookahead (0.56s)
-NUM_SAMPLES = 256     # trajectory samples
+NUM_SAMPLES = 512     # trajectory samples
 TEMPERATURE = 0.3     # MPPI inverse temperature
 NOISE_STD = 0.25      # std of joint angle perturbations (radians)
 CUMSUM_SCALE = 0.5    # scale for correlated (Brownian) noise
