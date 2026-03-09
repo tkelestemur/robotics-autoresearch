@@ -25,3 +25,4 @@ none	6.586	3118.5	discard	HEIGHT_WEIGHT=1.5 — regression
 none	9.432	1542.1	discard	UPRIGHT_WEIGHT=1.5 — regression
 none	9.823	1548.9	discard	TEMPERATURE=0.25 — regression from 0.3
 none	11.278	1890.5	keep	discount 0.98 per timestep — new best!
+none	11.377	1519.1	keep	discount 0.96 — another improvement!

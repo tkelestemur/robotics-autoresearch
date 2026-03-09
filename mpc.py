@@ -82,7 +82,7 @@ def compute_trajectory_costs(
 
     # Discount: weight earlier timesteps more (prioritize near-term)
     horizon = step_cost.shape[1]
-    discount = 0.98 ** np.arange(horizon)
+    discount = 0.96 ** np.arange(horizon)
     step_cost = step_cost * discount[np.newaxis, :]
 
     # Fall penalty
