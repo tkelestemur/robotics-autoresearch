@@ -1,2 +1,3 @@
 commit	avg_speed_mps	wall_time_s	status	description
 d66116e	1.246	84.4	keep	baseline MPPI with home position nominal, G1 position control
+none	9.097	1184.2	keep	best known config: H28 S256 T0.3 NS0.25 cumsum0.5 one-sided height vert0.5 SPEED15 CTRL0 SIM_DT0.005

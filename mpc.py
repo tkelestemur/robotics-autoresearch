@@ -21,36 +21,38 @@ from prepare import (
     parallel_rollout,
 )
 
-# ── Simulation timing (tune these!) ───────────────────────────────────────────
+# ── Simulation timing ────────────────────────────────────────────────────────
 
-SIM_DT = 0.002             # physics timestep (500 Hz)
+SIM_DT = 0.005             # physics timestep (200 Hz) — coarser = faster
 CONTROL_DT = 0.02          # control rate (50 Hz)
-CONTROL_SUBSTEPS = int(round(CONTROL_DT / SIM_DT))  # physics steps per control step
-SIM_DURATION = 30.0        # seconds of simulation
-N_CONTROL_STEPS = int(round(SIM_DURATION / CONTROL_DT))  # total control steps
+CONTROL_SUBSTEPS = int(round(CONTROL_DT / SIM_DT))  # = 4
+SIM_DURATION = 30.0
+N_CONTROL_STEPS = int(round(SIM_DURATION / CONTROL_DT))
 
-# ── MPPI Hyperparameters (tune these!) ────────────────────────────────────────
+# ── MPPI Hyperparameters ─────────────────────────────────────────────────────
 
-HORIZON = 10          # control steps lookahead (0.2s at 50 Hz)
-NUM_SAMPLES = 1024    # number of parallel trajectory samples (use 1024+ on GPU)
-TEMPERATURE = 0.5     # MPPI inverse temperature (lower = more greedy)
-NOISE_STD = 0.15      # std of joint angle perturbations (radians)
+HORIZON = 28          # control steps lookahead (0.56s)
+NUM_SAMPLES = 256     # trajectory samples
+TEMPERATURE = 0.3     # MPPI inverse temperature
+NOISE_STD = 0.25      # std of joint angle perturbations (radians)
+CUMSUM_SCALE = 0.5    # scale for correlated (Brownian) noise
 
 # Cost weights
-SPEED_WEIGHT = 5.0    # reward for forward velocity
-HEIGHT_WEIGHT = 2.0   # penalty for deviating from target height
-UPRIGHT_WEIGHT = 1.0  # penalty for not being upright
-CTRL_WEIGHT = 0.1     # penalty for deviation from home position
+SPEED_WEIGHT = 15.0
+HEIGHT_WEIGHT = 2.0
+UPRIGHT_WEIGHT = 1.0
+CTRL_WEIGHT = 0.0     # no control penalty
+VERT_WEIGHT = 0.5     # vertical velocity penalty
 
 # Target values
-TARGET_HEIGHT = 0.793  # desired torso height (m) — G1 standing height
-FALL_HEIGHT = 0.3      # below this = fallen
+TARGET_HEIGHT = 0.793
+FALL_HEIGHT = 0.3
 
-# Deterministic seed for reproducibility
+# Deterministic seed
 SEED = 42
 
 
-# ── Cost function ──────────────────────────────────────────────────────────────
+# ── Cost function ─────────────────────────────────────────────────────────────
 
 def compute_trajectory_costs(
     qpos_traj: np.ndarray,
@@ -58,34 +60,25 @@ def compute_trajectory_costs(
     control_seq: np.ndarray,
     home_pos: np.ndarray,
 ) -> np.ndarray:
-    """Compute costs for a batch of trajectories.
-
-    Args:
-        qpos_traj: (nbatch, horizon, nq) joint positions at control rate.
-        qvel_traj: (nbatch, horizon, nv) joint velocities at control rate.
-        control_seq: (nbatch, horizon, nu) joint angle target sequences.
-        home_pos: (nu,) home joint positions.
-
-    Returns:
-        costs: (nbatch,) total cost per trajectory.
-    """
+    """Compute costs for a batch of trajectories."""
     # Forward velocity reward
     vx = qvel_traj[:, :, 0]
     speed_cost = -SPEED_WEIGHT * vx
 
-    # Height penalty
+    # One-sided height penalty: only penalize below target
     z = qpos_traj[:, :, 2]
-    height_cost = HEIGHT_WEIGHT * (z - TARGET_HEIGHT) ** 2
+    height_diff = z - TARGET_HEIGHT
+    height_cost = HEIGHT_WEIGHT * np.where(height_diff < 0, height_diff ** 2, 0.0)
 
-    # Upright penalty (quaternion w component — 1.0 means perfectly upright)
+    # Upright penalty
     qw = qpos_traj[:, :, 3]
     upright_cost = UPRIGHT_WEIGHT * (1.0 - qw ** 2)
 
-    # Control effort: penalize deviation from home position
-    target_dev = control_seq - home_pos
-    ctrl_cost = CTRL_WEIGHT * np.sum(target_dev ** 2, axis=-1)
+    # Vertical velocity penalty
+    vz = qvel_traj[:, :, 2]
+    vert_cost = VERT_WEIGHT * vz ** 2
 
-    step_cost = speed_cost + height_cost + upright_cost + ctrl_cost
+    step_cost = speed_cost + height_cost + upright_cost + vert_cost
 
     # Fall penalty
     min_height = np.min(z, axis=1)
@@ -94,7 +87,7 @@ def compute_trajectory_costs(
     return np.sum(step_cost, axis=1) + fall_penalty
 
 
-# ── MPPI Controller ────────────────────────────────────────────────────────────
+# ── MPPI Controller ──────────────────────────────────────────────────────────
 
 _nominal: np.ndarray | None = None
 _home_pos: np.ndarray | None = None
@@ -102,11 +95,7 @@ _rng: np.random.Generator | None = None
 
 
 def get_action(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:
-    """MPPI controller: called at each control step by evaluate_speed().
-
-    Returns joint angle targets (nu,) to apply for the next control step.
-    MuJoCo's built-in PD converts these to torques at every physics substep.
-    """
+    """MPPI controller: called at each control step by evaluate_speed()."""
     global _nominal, _home_pos, _rng
 
     nu = model.nu
@@ -124,14 +113,15 @@ def get_action(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:
 
     current_state = get_initial_state(model, data)
 
-    # Sample noise in joint angle space (radians)
-    noise = _rng.standard_normal((NUM_SAMPLES, HORIZON, nu)) * NOISE_STD
+    # Correlated noise via cumulative sum (Brownian motion)
+    white_noise = _rng.standard_normal((NUM_SAMPLES, HORIZON, nu)) * NOISE_STD
+    noise = np.cumsum(white_noise, axis=1) * CUMSUM_SCALE
 
     # Candidate joint angle target sequences
     candidates = _nominal[np.newaxis, :, :] + noise
     candidates = np.clip(candidates, lo, hi)
 
-    # Roll out trajectories in parallel (GPU or CPU)
+    # Roll out trajectories in parallel
     nstep = HORIZON * CONTROL_SUBSTEPS
     qpos_traj, qvel_traj = parallel_rollout(
         model, current_state, candidates, nstep
@@ -201,7 +191,7 @@ def run_visualized(model: mujoco.MjModel, data: mujoco.MjData) -> None:
             time.sleep(0.1)
 
 
-# ── Main: run evaluation ──────────────────────────────────────────────────────
+# ── Main: run evaluation ────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import argparse
