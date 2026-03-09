@@ -4,7 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "mujoco>=3.5.0",
-    "mujoco-warp>=0.3.0; platform_system == 'Linux'",
+    "mujoco-warp>=0.3.0",
     "numpy",
     "matplotlib",
     "pandas",

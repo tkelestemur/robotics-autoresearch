@@ -1829,7 +1829,7 @@ dependencies = [
     { name = "jupyter" },
     { name = "matplotlib" },
     { name = "mujoco" },
-    { name = "mujoco-warp", marker = "sys_platform == 'linux'" },
+    { name = "mujoco-warp" },
     { name = "numpy" },
     { name = "pandas" },
 ]
@@ -1839,7 +1839,7 @@ requires-dist = [
     { name = "jupyter" },
     { name = "matplotlib" },
     { name = "mujoco", specifier = ">=3.5.0" },
-    { name = "mujoco-warp", marker = "sys_platform == 'linux'", specifier = ">=0.3.0" },
+    { name = "mujoco-warp", specifier = ">=0.3.0" },
     { name = "numpy" },
     { name = "pandas" },
 ]
@@ -2073,8 +2073,10 @@ dependencies = [
     { name = "numpy" },
 ]
 wheels = [
+    { url = "https://pypi.nvidia.com/warp-lang/warp_lang-1.12.0-py3-none-macosx_11_0_arm64.whl", hash = "sha256:c78c3701d5cad86c30ef5017410d294ec46a396bb0d502ee1c98743494f3a62f" },
     { url = "https://pypi.nvidia.com/warp-lang/warp_lang-1.12.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:a1436f60a1881cd94f787e751a83fc0987626be2d3e2b4e74c64a6947c6d1266" },
     { url = "https://pypi.nvidia.com/warp-lang/warp_lang-1.12.0-py3-none-manylinux_2_34_aarch64.whl", hash = "sha256:a2d6decba693aba5b828573c4414fd6a3f4c4a934db9c322736ef2b3fa99fe76" },
+    { url = "https://pypi.nvidia.com/warp-lang/warp_lang-1.12.0-py3-none-win_amd64.whl", hash = "sha256:697248edd2f1e2952f50e3db33b214af76173641a8894aacc467bed6dc247f8a" },
 ]
 
 [[package]]

@@ -32,7 +32,7 @@ N_CONTROL_STEPS = int(round(SIM_DURATION / CONTROL_DT))  # total control steps
 # ── MPPI Hyperparameters (tune these!) ────────────────────────────────────────
 
 HORIZON = 10          # control steps lookahead (0.2s at 50 Hz)
-NUM_SAMPLES = 128     # number of parallel trajectory samples
+NUM_SAMPLES = 1024    # number of parallel trajectory samples (use 1024+ on GPU)
 TEMPERATURE = 0.5     # MPPI inverse temperature (lower = more greedy)
 NOISE_STD = 0.15      # std of joint angle perturbations (radians)
 
