@@ -80,6 +80,11 @@ def compute_trajectory_costs(
 
     step_cost = speed_cost + height_cost + upright_cost + vert_cost
 
+    # Discount: weight earlier timesteps more (prioritize near-term)
+    horizon = step_cost.shape[1]
+    discount = 0.98 ** np.arange(horizon)
+    step_cost = step_cost * discount[np.newaxis, :]
+
     # Fall penalty
     min_height = np.min(z, axis=1)
     fall_penalty = np.where(min_height < FALL_HEIGHT, 1000.0, 0.0)

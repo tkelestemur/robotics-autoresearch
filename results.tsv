@@ -18,3 +18,10 @@ none	2.867	231.8	discard	spline 5 pts (fast only) — too constraining
 none	9.782	1522.8	discard	VERT_WEIGHT=0.3 — slight regression from 0.5
 none	4.959	2974.9	discard	NUM_SAMPLES=384 — much worse, non-power-of-2 bad on GPU
 none	10.596	1559.3	keep	SPEED_WEIGHT=12 — new best!
+none	8.762	2518.6	discard	SPEED_WEIGHT=10 — regression, too low
+none	5.860	2934.9	discard	SPEED_WEIGHT=13 — regression, too high
+none	8.217	2284.0	discard	SPEED_WEIGHT=11 — regression
+none	6.586	3118.5	discard	HEIGHT_WEIGHT=1.5 — regression
+none	9.432	1542.1	discard	UPRIGHT_WEIGHT=1.5 — regression
+none	9.823	1548.9	discard	TEMPERATURE=0.25 — regression from 0.3
+none	11.278	1890.5	keep	discount 0.98 per timestep — new best!
