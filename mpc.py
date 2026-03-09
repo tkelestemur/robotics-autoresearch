@@ -38,7 +38,7 @@ NOISE_STD = 0.25      # std of joint angle perturbations (radians)
 CUMSUM_SCALE = 0.5    # scale for correlated (Brownian) noise
 
 # Cost weights
-SPEED_WEIGHT = 15.0
+SPEED_WEIGHT = 12.0
 HEIGHT_WEIGHT = 2.0
 UPRIGHT_WEIGHT = 1.0
 CTRL_WEIGHT = 0.0     # no control penalty

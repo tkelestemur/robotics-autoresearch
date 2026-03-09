@@ -3,3 +3,18 @@ d66116e	1.246	84.4	keep	baseline MPPI with home position nominal, G1 position co
 328ae5d	9.097	1184.2	keep	best known config: H28 S256 T0.3 NS0.25 cumsum0.5 one-sided height vert0.5 SPEED15 CTRL0 SIM_DT0.005
 none	0.000	4764.3	discard	NUM_SAMPLES=1024 — nefc overflow, robot didn't move
 none	9.927	1527.9	keep	NUM_SAMPLES=512 — improvement over 256
+none	4.949	180.0	discard	HORIZON=20 (fast only) — regression from H28
+none	6.460	249.3	discard	SPEED_WEIGHT=20 (fast only) — regression from 15
+none	1.237	3912.9	discard	per-actuator noise scaling by ctrl range — 8.92 fast but 1.24 full
+none	3.688	4249.6	discard	HORIZON=32 with S512 — unstable at 30s
+none	5.852	250.4	discard	TEMPERATURE=0.2 (fast only) — regression from 0.3
+none	6.156	259.5	discard	dual noise 80/20 2x (fast only) — regression
+none	6.011	241.6	discard	standing gate for speed reward (fast only) — regression
+none	5.947	256.9	discard	predictive sampling best-of-N (fast only) — regression from MPPI
+none	5.470	309.3	discard	SIM_DT=0.004 (fast only) — regression, slower
+none	8.472	1492.0	discard	NOISE_STD=0.20 — 7.18 fast but 8.47 full (regression)
+none	9.075	1518.3	discard	NOISE_STD=0.30 CUMSUM_SCALE=0.4 — regression from 0.25/0.5
+none	2.867	231.8	discard	spline 5 pts (fast only) — too constraining
+none	9.782	1522.8	discard	VERT_WEIGHT=0.3 — slight regression from 0.5
+none	4.959	2974.9	discard	NUM_SAMPLES=384 — much worse, non-power-of-2 bad on GPU
+none	10.596	1559.3	keep	SPEED_WEIGHT=12 — new best!
