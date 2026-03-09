@@ -4,14 +4,23 @@ Downloads the Unitree G1 humanoid model, provides simulation helpers,
 and evaluates MPC controllers. This file is READ-ONLY to the agent.
 """
 
+import os
 import time
 import urllib.request
 import urllib.error
 from pathlib import Path
 
 import mujoco
-import mujoco.rollout
 import numpy as np
+
+# GPU acceleration (optional — falls back to CPU if unavailable)
+try:
+    import mujoco_warp as mjw
+    import warp as wp
+    _HAS_WARP = True
+except ImportError:
+    import mujoco.rollout
+    _HAS_WARP = False
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -154,7 +163,10 @@ def get_home_positions(model: mujoco.MjModel) -> np.ndarray:
 
 
 def get_initial_state(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:
-    """Extract full physics state (qpos, qvel, act, etc.)."""
+    """Extract full physics state (time, qpos, qvel, act).
+
+    State layout: [time(1), qpos(nq), qvel(nv), act(na)]
+    """
     state_spec = mujoco.mjtState.mjSTATE_FULLPHYSICS
     state_size = mujoco.mj_stateSize(model, state_spec)
     state = np.empty(state_size, dtype=np.float64)
@@ -170,57 +182,126 @@ def set_state(
     mujoco.mj_setState(model, data, state, state_spec)
 
 
-def make_data_list(
-    model: mujoco.MjModel, nthread: int
-) -> list[mujoco.MjData]:
-    """Create per-thread MjData instances for parallel rollouts."""
-    return [mujoco.MjData(model) for _ in range(nthread)]
+# ── Parallel rollout (GPU or CPU) ─────────────────────────────────────────────
+
+# GPU resources (lazy-initialized)
+_mjw_model = None
+_mjw_data = None
+_mjw_nworld = 0
+
+# CPU resources (lazy-initialized)
+_cpu_data_list = None
+_cpu_nthread = 0
 
 
 def parallel_rollout(
     model: mujoco.MjModel,
-    data_list: list[mujoco.MjData],
     initial_state: np.ndarray,
     control_seq: np.ndarray,
     nstep: int,
-) -> np.ndarray:
-    """Roll out sampled trajectories in parallel using mujoco.rollout.
+) -> tuple[np.ndarray, np.ndarray]:
+    """Roll out sampled trajectories in parallel.
+
+    Uses mujoco_warp (GPU) if available, otherwise falls back to
+    mujoco.rollout (CPU multithreaded).
 
     Args:
-        model: MjModel instance.
-        data_list: Per-thread MjData list (from make_data_list).
-        initial_state: Full physics state array.
+        model: MjModel instance (CPU).
+        initial_state: Full physics state from get_initial_state.
+            Layout: [time(1), qpos(nq), qvel(nv), act(na)].
         control_seq: Control sequences, shape (nbatch, horizon, nu).
-        nstep: Number of physics steps to simulate per trajectory.
-            The control_substeps is inferred as nstep // horizon.
+        nstep: Total physics steps (= horizon * control_substeps).
 
     Returns:
-        State trajectories, shape (nbatch, nstep, nstate).
+        qpos_traj: (nbatch, horizon, nq) positions at control rate.
+        qvel_traj: (nbatch, horizon, nv) velocities at control rate.
     """
-    nbatch = control_seq.shape[0]
-    horizon = control_seq.shape[1]
+    if _HAS_WARP:
+        return _rollout_warp(model, initial_state, control_seq, nstep)
+    else:
+        return _rollout_cpu(model, initial_state, control_seq, nstep)
+
+
+def _rollout_warp(model, initial_state, control_seq, nstep):
+    """GPU-accelerated rollout using mujoco_warp."""
+    global _mjw_model, _mjw_data, _mjw_nworld
+
+    nbatch, horizon, nu = control_seq.shape
     control_substeps = nstep // horizon
+    nq, nv = model.nq, model.nv
 
-    # Repeat each control for control_substeps physics steps
+    # Lazy GPU initialization
+    if _mjw_model is None:
+        _mjw_model = mjw.put_model(model)
+    if _mjw_data is None or _mjw_nworld != nbatch:
+        _mjw_data = mjw.make_data(model, nworld=nbatch)
+        _mjw_nworld = nbatch
+
+    # Extract qpos/qvel from flat state (skip time at index 0)
+    qpos0 = initial_state[1:1 + nq].astype(np.float32)
+    qvel0 = initial_state[1 + nq:1 + nq + nv].astype(np.float32)
+
+    # Broadcast initial state to all worlds
+    qpos_init = np.tile(qpos0, (nbatch, 1))
+    qvel_init = np.tile(qvel0, (nbatch, 1))
+
+    _mjw_data.qpos = wp.array(qpos_init, dtype=wp.float32)
+    _mjw_data.qvel = wp.array(qvel_init, dtype=wp.float32)
+    _mjw_data.time = wp.zeros(nbatch, dtype=wp.float32)
+    _mjw_data.qacc = wp.zeros((nbatch, nv), dtype=wp.float32)
+    _mjw_data.ctrl = wp.zeros((nbatch, nu), dtype=wp.float32)
+    mjw.forward(_mjw_model, _mjw_data)
+
+    # Rollout: step through horizon, recording state at control rate
+    qpos_traj = np.empty((nbatch, horizon, nq))
+    qvel_traj = np.empty((nbatch, horizon, nv))
+
+    for t in range(horizon):
+        _mjw_data.ctrl = wp.array(
+            control_seq[:, t, :].astype(np.float32), dtype=wp.float32
+        )
+        for _ in range(control_substeps):
+            mjw.step(_mjw_model, _mjw_data)
+
+        qpos_traj[:, t, :] = _mjw_data.qpos.numpy()
+        qvel_traj[:, t, :] = _mjw_data.qvel.numpy()
+
+    return qpos_traj, qvel_traj
+
+
+def _rollout_cpu(model, initial_state, control_seq, nstep):
+    """CPU fallback using mujoco.rollout (multithreaded)."""
+    global _cpu_data_list, _cpu_nthread
+
+    nbatch, horizon, nu = control_seq.shape
+    control_substeps = nstep // horizon
+    nq, nv = model.nq, model.nv
+
+    nthread = os.cpu_count() or 4
+    if _cpu_data_list is None or _cpu_nthread != nthread:
+        _cpu_data_list = [mujoco.MjData(model) for _ in range(nthread)]
+        _cpu_nthread = nthread
+
+    # Expand controls: repeat each for control_substeps physics steps
     ctrl_expanded = np.repeat(control_seq, control_substeps, axis=1)
-
-    # Tile initial state for all batches
     initial_states = np.tile(initial_state, (nbatch, 1))
 
     state_spec = mujoco.mjtState.mjSTATE_FULLPHYSICS
     state_size = mujoco.mj_stateSize(model, state_spec)
-
     state_traj = np.empty((nbatch, nstep, state_size), dtype=np.float64)
 
     mujoco.rollout.rollout(
-        model,
-        data_list,
-        initial_states,
-        ctrl_expanded,
-        state=state_traj,
+        model, _cpu_data_list, initial_states, ctrl_expanded, state=state_traj,
     )
 
-    return state_traj
+    # Extract qpos/qvel at control rate (skip time at index 0)
+    full_qpos = state_traj[:, :, 1:1 + nq]
+    full_qvel = state_traj[:, :, 1 + nq:1 + nq + nv]
+    ctrl_indices = np.arange(control_substeps - 1, nstep, control_substeps)
+    qpos_traj = full_qpos[:, ctrl_indices, :]
+    qvel_traj = full_qvel[:, ctrl_indices, :]
+
+    return qpos_traj, qvel_traj
 
 
 # ── Evaluation ─────────────────────────────────────────────────────────────────
@@ -275,6 +356,7 @@ if __name__ == "__main__":
 
     model, data = make_sim()
     print(f"Model loaded: {model.nq} qpos, {model.nv} qvel, {model.nu} actuators")
+    print(f"Backend: {'mujoco_warp (GPU)' if _HAS_WARP else 'mujoco.rollout (CPU)'}")
 
     # Show utility info
     gc = compute_grav_comp(model)

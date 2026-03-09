@@ -16,10 +16,9 @@ Functions you can import:
 - `make_sim() -> (model, data)` — loads G1 scene, resets to home keyframe (standing pose). Does NOT set timestep — caller should do `model.opt.timestep = SIM_DT`.
 - `compute_grav_comp(model) -> np.array` — returns (nu,) gravity compensation generalized forces for the home keyframe. For position actuators, the ctrl offset needed is `grav_comp / kp` where kp is the actuator gain.
 - `get_home_positions(model) -> np.array` — returns (nu,) home keyframe joint angles. Natural nominal for position control.
-- `get_initial_state(model, data) -> np.array` — extracts full physics state
+- `get_initial_state(model, data) -> np.array` — extracts full physics state. Layout: [time(1), qpos(nq), qvel(nv), act(na)].
 - `set_state(model, data, state)` — sets full physics state
-- `make_data_list(model, nthread) -> list[MjData]` — creates per-thread MjData for parallel rollouts
-- `parallel_rollout(model, data_list, initial_state, control_seq, nstep) -> state_traj` — rolls out trajectories in parallel. `control_seq` shape: `(nbatch, horizon, nu)`, `nstep` = total physics steps (control_substeps inferred as `nstep // horizon`). Returns `(nbatch, nstep, nstate)`.
+- `parallel_rollout(model, initial_state, control_seq, nstep) -> (qpos_traj, qvel_traj)` — rolls out trajectories in parallel. Uses GPU (mujoco_warp) if available, CPU fallback otherwise. `control_seq` shape: `(nbatch, horizon, nu)`, `nstep` = total physics steps. Returns `qpos_traj (nbatch, horizon, nq)` and `qvel_traj (nbatch, horizon, nv)` at control rate.
 - `evaluate_speed(model, data, n_steps=None) -> float` — runs MPC calling `mpc.get_action()` at each step. Imports `CONTROL_DT`, `CONTROL_SUBSTEPS`, `N_CONTROL_STEPS` from mpc at call time. Returns avg forward speed (m/s).
 
 ## Simulation Timing Constants (defined in mpc.py — you can change these!)
@@ -52,31 +51,21 @@ Actuator groups:
 - Left arm (7): shoulder_pitch/roll/yaw ±25Nm, elbow ±25Nm, wrist_roll ±25Nm, wrist_pitch/yaw ±5Nm
 - Right arm (7): same as left
 
-## State Layout (CRITICAL)
+## Rollout Return Format
 
-The state from `parallel_rollout` and `get_initial_state` uses `mjSTATE_FULLPHYSICS` which includes time:
+`parallel_rollout` returns `(qpos_traj, qvel_traj)` at control rate:
+- `qpos_traj`: shape `(nbatch, horizon, nq)` — one snapshot per control step
+- `qvel_traj`: shape `(nbatch, horizon, nv)` — one snapshot per control step
 
-```
-[time(1), qpos(36), qvel(35)] = 72 floats
-```
+Key indices (directly into qpos_traj / qvel_traj):
+- `qpos[:, :, 0]`: x-position (forward)
+- `qpos[:, :, 2]`: z-position (height)
+- `qpos[:, :, 3:7]`: quaternion (w, x, y, z)
+- `qpos[:, :, 7:]`: joint angles (29 actuated joints)
+- `qvel[:, :, 0]`: forward velocity (vx)
+- `qvel[:, :, 6:]`: joint velocities (29 actuated joints)
 
-**When indexing state trajectories in the cost function:**
-```python
-qpos = state_traj[:, :, 1:1+nq]        # skip time at index 0
-qvel = state_traj[:, :, 1+nq:1+nq+nv]  # after qpos
-```
-
-Key state indices (within qpos, after skipping time):
-- `qpos[0]`: x-position (forward)
-- `qpos[1]`: y-position (lateral)
-- `qpos[2]`: z-position (height)
-- `qpos[3:7]`: quaternion (w, x, y, z)
-- `qpos[7:]`: joint angles (29 actuated joints)
-- `qvel[0]`: forward velocity (vx)
-- `qvel[1]`: lateral velocity (vy)
-- `qvel[2]`: vertical velocity (vz)
-- `qvel[3:6]`: angular velocity
-- `qvel[6:]`: joint velocities (29 actuated joints)
+No time offset — index directly.
 
 ## Current mpc.py Design
 
@@ -147,29 +136,57 @@ none	0.980	92.1	discard	doubled horizon to 20
 - `prepare.py` — do not modify this file
 - The robot model (Unitree G1 from mujoco_menagerie)
 
-## Hints for Improvement
+## Critical: Preventing Exploitation
 
-1. **Cost function tuning**: The baseline cost weights may not be optimal. The speed reward might need to be much higher relative to other terms.
-2. **CEM or predictive sampling**: MPPI is one approach; Cross-Entropy Method or simple predictive sampling may work better.
-3. **Correlated noise**: Temporally correlated noise (e.g., via interpolation or filtering) produces smoother, more physically plausible trajectories.
-4. **Gait symmetry**: Add rewards for symmetric leg motion to encourage natural walking/running gaits.
-5. **Longer horizon**: More lookahead may help, but costs more compute. Balance speed vs. quality.
-6. **Action parameterization**: Spline-based or CPG-based control can reduce the search space dramatically.
-7. **Warm-starting**: The baseline already shifts the previous solution by one step. Consider more sophisticated warm-starting.
-8. **Adaptive noise**: Reduce noise scale as the solution converges within an episode.
-9. **Contact-aware costs**: Use contact information to reward proper foot placement.
-10. **Per-actuator noise scaling**: Legs might benefit from different noise scales than arms/waist.
-11. **Simulation timing**: Faster control rate (smaller CONTROL_DT) gives finer control but more compute. Coarser physics (larger SIM_DT) is faster but less accurate.
+The robot MUST actually walk or run — not fall down and slide forward. The current baseline's forward speed comes partly from the body falling and moving forward, which is not real locomotion. Your cost function must prevent this.
+
+### Anti-exploitation cost terms (from mjpc humanoid walk task)
+
+1. **Move feet term** (CRITICAL): Penalize `com_vel_x - 0.5*(foot_left_vel_x + foot_right_vel_x)`. If the body moves forward but feet don't, this cost is large. This forces actual stepping rather than falling/sliding. Approximate foot velocities from joint velocities or from consecutive qpos differences.
+
+2. **Standing gate**: Compute `standing = height / sqrt(height^2 + 0.45^2) - 0.4`. This is ~0 when fallen, ~0.6 when upright. Multiply speed reward and balance terms by this factor. When fallen, only height/upright penalties are active (encouraging recovery). When standing, forward speed is rewarded.
+
+3. **Capture point balance**: `capture_point = com_xy + 0.3 * com_vel_xy`. Penalize distance from the support polygon (midpoint between feet). This encourages dynamically balanced locomotion.
+
+4. **Height penalty**: Use a smooth, tolerant norm instead of quadratic — e.g., `(|h-h_target|^4 + eps^4)^(1/4)` which has a flat dead zone near the target and penalizes large deviations linearly.
+
+### How to compute foot positions/velocities from qpos/qvel
+
+Foot positions can be approximated from the kinematic chain:
+- Left ankle roll joint: actuator index 5 → qpos[12], qvel[11]
+- Right ankle roll joint: actuator index 11 → qpos[18], qvel[17]
+
+For a rough approximation, you can track `qpos[0]` (com x-position) minus the ankle joint angles to detect if feet are moving with the body. A more precise approach: use `data.xpos` (body Cartesian positions) from the CPU simulation state, but this is not available in the parallel rollout return values. Instead, approximate from the joint angles.
+
+An even simpler anti-exploitation approach: penalize if the robot's z-height drops below standing height while it has forward velocity. Real running maintains height; falling doesn't.
+
+## Algorithmic Insights (from mjpc)
+
+Google's mjpc uses these techniques for successful humanoid locomotion:
+
+1. **Spline parameterization**: Instead of optimizing raw controls at each timestep, optimize P spline control points and interpolate. mjpc uses only **3 cubic spline points** for a 0.35s horizon. This reduces dimensionality from `horizon × nu` (~290) to `P × nu` (~87), making the search much more efficient. Even N=10 samples suffice with splines.
+
+2. **Predictive sampling** (best-of-N): Generate N candidates around the nominal, pick the single best. Simpler than MPPI's soft-max weighting and surprisingly competitive.
+
+3. **CEM (Cross-Entropy Method)**: Iteratively refine a Gaussian (mean + variance) using the top-K elite samples. More aggressive than MPPI for high-dimensional problems.
+
+4. **Short horizon**: 0.35 seconds works for humanoid walking — less than a single gait cycle. Longer isn't necessarily better.
+
+5. **Noise scaled by control range**: `noise_std * 0.5 * (ctrl_max - ctrl_min)` per actuator, not a fixed std for all.
+
+6. **Dual noise exploration**: 80% of samples use the primary noise level, 20% use a 2x larger noise level for diversity.
+
+7. **Control cost with cosh norm**: `p^2 * (cosh(ctrl/p) - 1)` — quadratic for small controls, linear for large. Better than quadratic for locomotion where some joints need large torques.
 
 ## Important Notes
 
-- Full evaluation takes ~85s wall time. Fast eval (`--fast`) takes ~14s.
+- Full evaluation takes ~85s wall time on CPU. Fast eval (`--fast`) takes ~14s. GPU is much faster.
 - Use `--fast` to screen for crashes and gross performance before full eval.
 - The robot starts in a standing pose. It needs to learn to walk/run from there.
 - Forward speed is measured along the x-axis (qpos[0]).
 - A negative speed means the robot went backward — that's bad.
 - If the robot falls (height < 0.3m), the cost function penalizes heavily.
-- The `mujoco.rollout` module handles parallelism — you don't need to manage threads.
 - The `compute_grav_comp()` and `get_home_positions()` functions are available from prepare.py — use them.
 - Always check for crashes before recording results.
+- With GPU (mujoco_warp), you can increase NUM_SAMPLES to 1024+ for much better trajectory optimization.
 - Make ONE change at a time so you can attribute improvements. Don't combine multiple changes in a single experiment.

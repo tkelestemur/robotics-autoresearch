@@ -8,7 +8,6 @@ targets (radians). MuJoCo's built-in PD (kp=500, dampratio=1) converts
 these to torques at every physics substep.
 """
 
-import os
 import time
 
 import mujoco
@@ -17,7 +16,6 @@ import numpy as np
 from prepare import (
     compute_grav_comp,
     get_home_positions,
-    make_data_list,
     make_sim,
     get_initial_state,
     parallel_rollout,
@@ -48,9 +46,6 @@ CTRL_WEIGHT = 0.1     # penalty for deviation from home position
 TARGET_HEIGHT = 0.793  # desired torso height (m) — G1 standing height
 FALL_HEIGHT = 0.3      # below this = fallen
 
-# Parallelism
-NTHREAD = os.cpu_count() or 4
-
 # Deterministic seed for reproducibility
 SEED = 42
 
@@ -58,45 +53,32 @@ SEED = 42
 # ── Cost function ──────────────────────────────────────────────────────────────
 
 def compute_trajectory_costs(
-    state_traj: np.ndarray,
+    qpos_traj: np.ndarray,
+    qvel_traj: np.ndarray,
     control_seq: np.ndarray,
-    nq: int,
-    nv: int,
     home_pos: np.ndarray,
 ) -> np.ndarray:
     """Compute costs for a batch of trajectories.
 
     Args:
-        state_traj: (nbatch, nstep, nstate) full physics states.
+        qpos_traj: (nbatch, horizon, nq) joint positions at control rate.
+        qvel_traj: (nbatch, horizon, nv) joint velocities at control rate.
         control_seq: (nbatch, horizon, nu) joint angle target sequences.
-        nq: number of generalized positions.
-        nv: number of generalized velocities.
         home_pos: (nu,) home joint positions.
 
     Returns:
         costs: (nbatch,) total cost per trajectory.
     """
-    nstep = state_traj.shape[1]
-
-    # State layout: [time(1), qpos(nq), qvel(nv), act(na)]
-    qpos = state_traj[:, :, 1:1 + nq]
-    qvel = state_traj[:, :, 1 + nq:1 + nq + nv]
-
-    # Sample at control rate (end of each control interval)
-    ctrl_indices = np.arange(CONTROL_SUBSTEPS - 1, nstep, CONTROL_SUBSTEPS)
-    qpos_ctrl = qpos[:, ctrl_indices, :]
-    qvel_ctrl = qvel[:, ctrl_indices, :]
-
     # Forward velocity reward
-    vx = qvel_ctrl[:, :, 0]
+    vx = qvel_traj[:, :, 0]
     speed_cost = -SPEED_WEIGHT * vx
 
     # Height penalty
-    z = qpos_ctrl[:, :, 2]
+    z = qpos_traj[:, :, 2]
     height_cost = HEIGHT_WEIGHT * (z - TARGET_HEIGHT) ** 2
 
     # Upright penalty (quaternion w component — 1.0 means perfectly upright)
-    qw = qpos_ctrl[:, :, 3]
+    qw = qpos_traj[:, :, 3]
     upright_cost = UPRIGHT_WEIGHT * (1.0 - qw ** 2)
 
     # Control effort: penalize deviation from home position
@@ -116,7 +98,6 @@ def compute_trajectory_costs(
 
 _nominal: np.ndarray | None = None
 _home_pos: np.ndarray | None = None
-_data_list: list | None = None
 _rng: np.random.Generator | None = None
 
 
@@ -126,11 +107,9 @@ def get_action(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:
     Returns joint angle targets (nu,) to apply for the next control step.
     MuJoCo's built-in PD converts these to torques at every physics substep.
     """
-    global _nominal, _home_pos, _data_list, _rng
+    global _nominal, _home_pos, _rng
 
     nu = model.nu
-    nq = model.nq
-    nv = model.nv
     ctrl_range = model.actuator_ctrlrange
     lo = ctrl_range[:, 0]
     hi = ctrl_range[:, 1]
@@ -142,8 +121,6 @@ def get_action(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:
         _home_pos = get_home_positions(model)
     if _nominal is None or _nominal.shape != (HORIZON, nu):
         _nominal = np.tile(_home_pos, (HORIZON, 1))
-    if _data_list is None:
-        _data_list = make_data_list(model, NTHREAD)
 
     current_state = get_initial_state(model, data)
 
@@ -154,12 +131,14 @@ def get_action(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:
     candidates = _nominal[np.newaxis, :, :] + noise
     candidates = np.clip(candidates, lo, hi)
 
-    # Roll out trajectories in parallel
+    # Roll out trajectories in parallel (GPU or CPU)
     nstep = HORIZON * CONTROL_SUBSTEPS
-    state_traj = parallel_rollout(model, _data_list, current_state, candidates, nstep)
+    qpos_traj, qvel_traj = parallel_rollout(
+        model, current_state, candidates, nstep
+    )
 
     # Compute costs
-    costs = compute_trajectory_costs(state_traj, candidates, nq, nv, _home_pos)
+    costs = compute_trajectory_costs(qpos_traj, qvel_traj, candidates, _home_pos)
 
     # MPPI weights
     costs_shifted = costs - np.min(costs)
@@ -237,7 +216,6 @@ if __name__ == "__main__":
     # Reset globals for fresh run
     _nominal = None
     _home_pos = None
-    _data_list = None
     _rng = None
 
     print("Setting up simulation...")
@@ -257,7 +235,7 @@ if __name__ == "__main__":
 
         n_steps = 250 if args.fast else N_CONTROL_STEPS
         duration = n_steps * CONTROL_DT
-        print(f"Running MPPI controller for {duration:.0f}s (threads={NTHREAD})...")
+        print(f"Running MPPI controller for {duration:.0f}s...")
 
         t0 = time.time()
         avg_speed = evaluate_speed(model, data, n_steps=n_steps)

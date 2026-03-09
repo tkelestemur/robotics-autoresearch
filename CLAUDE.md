@@ -18,6 +18,7 @@ Read `program.md` for full instructions. This is an autoresearch loop where you 
 - `compute_grav_comp(model)` — gravity compensation generalized forces (nu,)
 - `get_home_positions(model)` — home keyframe joint angles (nu,)
 - `evaluate_speed(model, data, n_steps)` — imports timing constants from mpc.py
+- `parallel_rollout(model, initial_state, control_seq, nstep)` — returns `(qpos_traj, qvel_traj)` at control rate. GPU (mujoco_warp) if available, CPU fallback otherwise.
 
 ## Tunable timing constants (in mpc.py)
 
