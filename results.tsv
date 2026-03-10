@@ -1,2 +1,5 @@
 commit	avg_speed_mps	wall_time_s	status	description
 d66116e	1.246	84.4	keep	baseline MPPI with home position nominal, G1 position control
+none	2.982	59.2	discard	exp1: one-sided height penalty (fast only, regression)
+none	2.967	60.3	discard	exp2: correlated cumsum noise (fast only, regression)
+pending	6.799	681.8	keep	exp3: HORIZON 10->20 (0.4s lookahead)
