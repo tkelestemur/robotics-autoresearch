@@ -109,6 +109,14 @@ def make_sim() -> tuple[mujoco.MjModel, mujoco.MjData]:
 
     model = mujoco.MjModel.from_xml_path(str(scene_path))
 
+    # Solver tuning (from mjlab best practices)
+    model.opt.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+    model.opt.solver = mujoco.mjtSolver.mjSOL_NEWTON
+    model.opt.cone = mujoco.mjtCone.mjCONE_PYRAMIDAL
+    model.opt.iterations = 100
+    model.opt.ls_iterations = 50
+    model.opt.ccd_iterations = 50  # default 35 triggers warnings
+
     # Restrict contacts to foot-floor only. This disables body/limb contacts
     # which dramatically reduces constraint count (njmax 161→~32) and prevents
     # the robot from exploiting body-floor sliding for forward motion.
@@ -207,6 +215,9 @@ class WarpRollout:
     host→device transfers in the inner loop.
     """
 
+    # Minimum CUDA driver version for graph capture (from mjlab)
+    _GRAPH_MIN_DRIVER = (12, 4)
+
     def __init__(self):
         self._model = None
         self._data = None
@@ -215,19 +226,36 @@ class WarpRollout:
         self._qvel_buf = None
         self._ctrl_dev = None  # full control seq on device (horizon, nbatch, nu)
         self._horizon = 0
-        self._step_graph = None  # CUDA graph for mjw.step
+        self._step_graph = None  # CUDA graph for control_substeps × mjw.step
+        self._fwd_graph = None   # CUDA graph for mjw.forward
         self._use_graphs = False
         self._control_substeps = 0
+        self._device = wp.get_preferred_device()
+
+    def _can_use_graphs(self) -> bool:
+        """Check if CUDA graphs are safe to use (driver + mempool)."""
+        if not self._device.is_cuda:
+            return False
+        driver = wp.context.runtime.driver_version
+        if driver is None or driver < self._GRAPH_MIN_DRIVER:
+            return False
+        return wp.is_mempool_enabled(self._device)
 
     def _ensure_model(self, model: mujoco.MjModel) -> None:
         if self._model is None:
-            self._model = mjw.put_model(model)
+            with wp.ScopedDevice(self._device):
+                self._model = mjw.put_model(model)
+                self._model.opt.ls_parallel = True  # parallel line-search
 
     def _ensure_data(self, model: mujoco.MjModel, nbatch: int) -> None:
         if self._data is None or self._nworld != nbatch:
-            self._data = mjw.make_data(model, nworld=nbatch, njmax=80, nconmax=16)
+            with wp.ScopedDevice(self._device):
+                self._data = mjw.make_data(
+                    model, nworld=nbatch, njmax=80, nconmax=16,
+                )
             self._nworld = nbatch
-            self._step_graph = None  # invalidate graph on data change
+            self._step_graph = None  # invalidate graphs on data change
+            self._fwd_graph = None
 
     def _ensure_buffers(
         self, horizon: int, nbatch: int, nq: int, nv: int, nu: int,
@@ -240,18 +268,21 @@ class WarpRollout:
             self._ctrl_dev = wp.zeros((horizon, nbatch, nu), dtype=wp.float32)
             self._horizon = horizon
 
-    def _ensure_graph(self, control_substeps: int) -> None:
-        """Capture a CUDA graph for `control_substeps` calls to mjw.step."""
-        if not wp.is_cuda_available():
+    def _ensure_graphs(self, control_substeps: int) -> None:
+        """Capture CUDA graphs for step and forward."""
+        if not self._can_use_graphs():
             return
         if (self._step_graph is not None
                 and self._control_substeps == control_substeps):
             return
-        # Capture the inner physics loop as a CUDA graph
-        with wp.ScopedCapture() as capture:
-            for _ in range(control_substeps):
-                mjw.step(self._model, self._data)
-        self._step_graph = capture.graph
+        with wp.ScopedDevice(self._device):
+            with wp.ScopedCapture() as capture:
+                for _ in range(control_substeps):
+                    mjw.step(self._model, self._data)
+            self._step_graph = capture.graph
+            with wp.ScopedCapture() as capture:
+                mjw.forward(self._model, self._data)
+            self._fwd_graph = capture.graph
         self._control_substeps = control_substeps
         self._use_graphs = True
 
@@ -282,7 +313,7 @@ class WarpRollout:
         self._ensure_model(model)
         self._ensure_data(model, nbatch)
         self._ensure_buffers(horizon, nbatch, nq, nv, nu)
-        self._ensure_graph(control_substeps)
+        self._ensure_graphs(control_substeps)
 
         # Set initial state in-place (no allocation)
         qpos0 = initial_state[1:1 + nq].astype(np.float32)
@@ -290,35 +321,41 @@ class WarpRollout:
         qpos_init = np.tile(qpos0, (nbatch, 1))
         qvel_init = np.tile(qvel0, (nbatch, 1))
 
-        self._data.qpos.assign(qpos_init)
-        self._data.qvel.assign(qvel_init)
-        self._data.time.zero_()
-        self._data.qacc.zero_()
-        self._data.ctrl.zero_()
-        mjw.forward(self._model, self._data)
-
         # Upload full control sequence to device in one transfer
         # Layout: (horizon, nbatch, nu) — each [t] slice is contiguous
         ctrl_f32 = np.ascontiguousarray(
             control_seq.transpose(1, 0, 2), dtype=np.float32
         )
-        self._ctrl_dev.assign(ctrl_f32)
 
-        # Rollout: step through horizon, accumulate on device
-        for t in range(horizon):
-            # Device-to-device ctrl copy (no host involvement)
-            wp.copy(self._data.ctrl, self._ctrl_dev,
-                    src_offset=t * nbatch * nu, count=nbatch * nu)
+        with wp.ScopedDevice(self._device):
+            # Reset state
+            self._data.qpos.assign(qpos_init)
+            self._data.qvel.assign(qvel_init)
+            self._data.time.zero_()
+            self._data.qacc.zero_()
+            self._data.ctrl.zero_()
             if self._use_graphs:
-                wp.capture_launch(self._step_graph)
+                wp.capture_launch(self._fwd_graph)
             else:
-                for _ in range(control_substeps):
-                    mjw.step(self._model, self._data)
-            # Record trajectory on device (no host sync)
-            wp.copy(self._qpos_buf, self._data.qpos,
-                    dest_offset=t * nbatch * nq, count=nbatch * nq)
-            wp.copy(self._qvel_buf, self._data.qvel,
-                    dest_offset=t * nbatch * nv, count=nbatch * nv)
+                mjw.forward(self._model, self._data)
+
+            self._ctrl_dev.assign(ctrl_f32)
+
+            # Rollout: step through horizon, accumulate on device
+            for t in range(horizon):
+                # Device-to-device ctrl copy (no host involvement)
+                wp.copy(self._data.ctrl, self._ctrl_dev,
+                        src_offset=t * nbatch * nu, count=nbatch * nu)
+                if self._use_graphs:
+                    wp.capture_launch(self._step_graph)
+                else:
+                    for _ in range(control_substeps):
+                        mjw.step(self._model, self._data)
+                # Record trajectory on device (no host sync)
+                wp.copy(self._qpos_buf, self._data.qpos,
+                        dest_offset=t * nbatch * nq, count=nbatch * nq)
+                wp.copy(self._qvel_buf, self._data.qvel,
+                        dest_offset=t * nbatch * nv, count=nbatch * nv)
 
         # Single device→host transfer
         qpos_raw = self._qpos_buf.numpy().reshape(horizon, nbatch, nq)
