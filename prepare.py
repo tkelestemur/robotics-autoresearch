@@ -201,6 +201,10 @@ class WarpRollout:
     Lazily initializes device model, data, and trajectory buffers on first
     use. Reuses allocations across calls; only reallocates when batch size
     or horizon changes.
+
+    On GPU: uses CUDA graph capture to eliminate per-step kernel launch
+    overhead, and keeps the full control sequence on device to avoid
+    host→device transfers in the inner loop.
     """
 
     def __init__(self):
@@ -209,7 +213,11 @@ class WarpRollout:
         self._nworld = 0
         self._qpos_buf = None
         self._qvel_buf = None
+        self._ctrl_dev = None  # full control seq on device (horizon, nbatch, nu)
         self._horizon = 0
+        self._step_graph = None  # CUDA graph for mjw.step
+        self._use_graphs = False
+        self._control_substeps = 0
 
     def _ensure_model(self, model: mujoco.MjModel) -> None:
         if self._model is None:
@@ -219,14 +227,33 @@ class WarpRollout:
         if self._data is None or self._nworld != nbatch:
             self._data = mjw.make_data(model, nworld=nbatch, njmax=80, nconmax=16)
             self._nworld = nbatch
+            self._step_graph = None  # invalidate graph on data change
 
-    def _ensure_buffers(self, horizon: int, nbatch: int, nq: int, nv: int) -> None:
+    def _ensure_buffers(
+        self, horizon: int, nbatch: int, nq: int, nv: int, nu: int,
+    ) -> None:
         if (self._qpos_buf is None
                 or self._horizon != horizon
                 or self._qpos_buf.shape[1] != nbatch):
             self._qpos_buf = wp.zeros((horizon, nbatch, nq), dtype=wp.float32)
             self._qvel_buf = wp.zeros((horizon, nbatch, nv), dtype=wp.float32)
+            self._ctrl_dev = wp.zeros((horizon, nbatch, nu), dtype=wp.float32)
             self._horizon = horizon
+
+    def _ensure_graph(self, control_substeps: int) -> None:
+        """Capture a CUDA graph for `control_substeps` calls to mjw.step."""
+        if not wp.is_cuda_available():
+            return
+        if (self._step_graph is not None
+                and self._control_substeps == control_substeps):
+            return
+        # Capture the inner physics loop as a CUDA graph
+        with wp.ScopedCapture() as capture:
+            for _ in range(control_substeps):
+                mjw.step(self._model, self._data)
+        self._step_graph = capture.graph
+        self._control_substeps = control_substeps
+        self._use_graphs = True
 
     def rollout(
         self,
@@ -254,7 +281,8 @@ class WarpRollout:
 
         self._ensure_model(model)
         self._ensure_data(model, nbatch)
-        self._ensure_buffers(horizon, nbatch, nq, nv)
+        self._ensure_buffers(horizon, nbatch, nq, nv, nu)
+        self._ensure_graph(control_substeps)
 
         # Set initial state in-place (no allocation)
         qpos0 = initial_state[1:1 + nq].astype(np.float32)
@@ -269,18 +297,24 @@ class WarpRollout:
         self._data.ctrl.zero_()
         mjw.forward(self._model, self._data)
 
-        # Cast control_seq to float32 once, rearrange to (horizon, nbatch, nu)
-        # so each ctrl_f32[t] is a contiguous (nbatch, nu) slice
+        # Upload full control sequence to device in one transfer
+        # Layout: (horizon, nbatch, nu) — each [t] slice is contiguous
         ctrl_f32 = np.ascontiguousarray(
             control_seq.transpose(1, 0, 2), dtype=np.float32
         )
+        self._ctrl_dev.assign(ctrl_f32)
 
         # Rollout: step through horizon, accumulate on device
         for t in range(horizon):
-            self._data.ctrl.assign(ctrl_f32[t])
-            for _ in range(control_substeps):
-                mjw.step(self._model, self._data)
-            # Copy qpos/qvel into trajectory buffer on device (no host sync)
+            # Device-to-device ctrl copy (no host involvement)
+            wp.copy(self._data.ctrl, self._ctrl_dev,
+                    src_offset=t * nbatch * nu, count=nbatch * nu)
+            if self._use_graphs:
+                wp.capture_launch(self._step_graph)
+            else:
+                for _ in range(control_substeps):
+                    mjw.step(self._model, self._data)
+            # Record trajectory on device (no host sync)
             wp.copy(self._qpos_buf, self._data.qpos,
                     dest_offset=t * nbatch * nq, count=nbatch * nq)
             wp.copy(self._qvel_buf, self._data.qvel,
