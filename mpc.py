@@ -85,7 +85,11 @@ def compute_trajectory_costs(
     target_dev = control_seq - home_pos
     ctrl_cost = CTRL_WEIGHT * np.sum(target_dev ** 2, axis=-1)
 
-    step_cost = speed_cost + height_cost + upright_cost + ctrl_cost
+    # Vertical velocity penalty (discourage bouncing)
+    vz = qvel_traj[:, :, 2]
+    vert_cost = 0.5 * vz ** 2
+
+    step_cost = speed_cost + height_cost + upright_cost + ctrl_cost + vert_cost
 
     # Fall penalty
     min_height = np.min(z, axis=1)
