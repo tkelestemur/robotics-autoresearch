@@ -182,6 +182,9 @@ def set_state(
 _mjw_model = None
 _mjw_data = None
 _mjw_nworld = 0
+_qpos_buf = None  # on-device trajectory buffer (horizon, nbatch, nq)
+_qvel_buf = None  # on-device trajectory buffer (horizon, nbatch, nv)
+_horizon = 0
 
 
 def parallel_rollout(
@@ -205,7 +208,7 @@ def parallel_rollout(
         qpos_traj: (nbatch, horizon, nq) positions at control rate.
         qvel_traj: (nbatch, horizon, nv) velocities at control rate.
     """
-    global _mjw_model, _mjw_data, _mjw_nworld
+    global _mjw_model, _mjw_data, _mjw_nworld, _qpos_buf, _qvel_buf, _horizon
 
     nbatch, horizon, nu = control_seq.shape
     control_substeps = nstep // horizon
@@ -217,37 +220,45 @@ def parallel_rollout(
     if _mjw_data is None or _mjw_nworld != nbatch:
         _mjw_data = mjw.make_data(model, nworld=nbatch, njmax=300, nconmax=60)
         _mjw_nworld = nbatch
+    if _qpos_buf is None or _horizon != horizon or _qpos_buf.shape[1] != nbatch:
+        _qpos_buf = wp.zeros((horizon, nbatch, nq), dtype=wp.float32)
+        _qvel_buf = wp.zeros((horizon, nbatch, nv), dtype=wp.float32)
+        _horizon = horizon
 
-    # Extract qpos/qvel from flat state (skip time at index 0)
+    # Set initial state in-place (no allocation)
     qpos0 = initial_state[1:1 + nq].astype(np.float32)
     qvel0 = initial_state[1 + nq:1 + nq + nv].astype(np.float32)
-
-    # Broadcast initial state to all worlds
     qpos_init = np.tile(qpos0, (nbatch, 1))
     qvel_init = np.tile(qvel0, (nbatch, 1))
 
-    _mjw_data.qpos = wp.array(qpos_init, dtype=wp.float32)
-    _mjw_data.qvel = wp.array(qvel_init, dtype=wp.float32)
-    _mjw_data.time = wp.zeros(nbatch, dtype=wp.float32)
-    _mjw_data.qacc = wp.zeros((nbatch, nv), dtype=wp.float32)
-    _mjw_data.ctrl = wp.zeros((nbatch, nu), dtype=wp.float32)
+    _mjw_data.qpos.assign(qpos_init)
+    _mjw_data.qvel.assign(qvel_init)
+    _mjw_data.time.zero_()
+    _mjw_data.qacc.zero_()
+    _mjw_data.ctrl.zero_()
     mjw.forward(_mjw_model, _mjw_data)
 
-    # Rollout: step through horizon, recording state at control rate
-    qpos_traj = np.empty((nbatch, horizon, nq))
-    qvel_traj = np.empty((nbatch, horizon, nv))
+    # Cast control_seq to float32 once, rearrange to (horizon, nbatch, nu)
+    # so each ctrl_f32[t] is a contiguous (nbatch, nu) slice
+    ctrl_f32 = np.ascontiguousarray(
+        control_seq.transpose(1, 0, 2), dtype=np.float32
+    )
 
+    # Rollout: step through horizon, accumulate on device
     for t in range(horizon):
-        _mjw_data.ctrl = wp.array(
-            control_seq[:, t, :].astype(np.float32), dtype=wp.float32
-        )
+        _mjw_data.ctrl.assign(ctrl_f32[t])
         for _ in range(control_substeps):
             mjw.step(_mjw_model, _mjw_data)
+        # Copy qpos/qvel into trajectory buffer on device (no host sync)
+        wp.copy(_qpos_buf, _mjw_data.qpos,
+                dest_offset=t * nbatch * nq, count=nbatch * nq)
+        wp.copy(_qvel_buf, _mjw_data.qvel,
+                dest_offset=t * nbatch * nv, count=nbatch * nv)
 
-        qpos_traj[:, t, :] = _mjw_data.qpos.numpy()
-        qvel_traj[:, t, :] = _mjw_data.qvel.numpy()
-
-    return qpos_traj, qvel_traj
+    # Single device→host transfer
+    qpos_raw = _qpos_buf.numpy().reshape(horizon, nbatch, nq)
+    qvel_raw = _qvel_buf.numpy().reshape(horizon, nbatch, nv)
+    return qpos_raw.transpose(1, 0, 2).copy(), qvel_raw.transpose(1, 0, 2).copy()
 
 
 # ── Evaluation ─────────────────────────────────────────────────────────────────
