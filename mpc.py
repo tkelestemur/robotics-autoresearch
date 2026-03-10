@@ -23,7 +23,7 @@ from prepare import (
 
 # ── Simulation timing (tune these!) ───────────────────────────────────────────
 
-SIM_DT = 0.002             # physics timestep (500 Hz)
+SIM_DT = 0.005             # physics timestep (200 Hz)
 CONTROL_DT = 0.02          # control rate (50 Hz)
 CONTROL_SUBSTEPS = int(round(CONTROL_DT / SIM_DT))  # physics steps per control step
 SIM_DURATION = 30.0        # seconds of simulation
