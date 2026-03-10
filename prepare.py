@@ -109,13 +109,8 @@ def make_sim() -> tuple[mujoco.MjModel, mujoco.MjData]:
 
     model = mujoco.MjModel.from_xml_path(str(scene_path))
 
-    # Solver tuning (from mjlab best practices)
-    model.opt.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
-    model.opt.solver = mujoco.mjtSolver.mjSOL_NEWTON
-    model.opt.cone = mujoco.mjtCone.mjCONE_PYRAMIDAL
-    model.opt.iterations = 100
-    model.opt.ls_iterations = 50
-    model.opt.ccd_iterations = 50  # default 35 triggers warnings
+    # Fix CCD iteration warning (default 35 is too low for G1)
+    model.opt.ccd_iterations = 50
 
     # Restrict contacts to foot-floor only. This disables body/limb contacts
     # which dramatically reduces constraint count (njmax 161→~32) and prevents
@@ -245,7 +240,6 @@ class WarpRollout:
         if self._model is None:
             with wp.ScopedDevice(self._device):
                 self._model = mjw.put_model(model)
-                self._model.opt.ls_parallel = True  # parallel line-search
 
     def _ensure_data(self, model: mujoco.MjModel, nbatch: int) -> None:
         if self._data is None or self._nworld != nbatch:
