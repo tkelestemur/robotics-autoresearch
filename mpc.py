@@ -129,8 +129,9 @@ def get_action(model: mujoco.MjModel, data: mujoco.MjData) -> np.ndarray:
 
     current_state = get_initial_state(model, data)
 
-    # Sample noise in joint angle space (radians)
-    noise = _rng.standard_normal((NUM_SAMPLES, HORIZON, nu)) * NOISE_STD
+    # Sample correlated noise via cumulative sum (smooth trajectories)
+    raw = _rng.standard_normal((NUM_SAMPLES, HORIZON, nu)) * NOISE_STD
+    noise = np.cumsum(raw, axis=1) * 0.5
 
     # Candidate joint angle target sequences
     candidates = _nominal[np.newaxis, :, :] + noise
