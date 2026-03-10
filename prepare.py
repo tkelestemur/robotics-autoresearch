@@ -108,6 +108,21 @@ def make_sim() -> tuple[mujoco.MjModel, mujoco.MjData]:
         download_g1_model()
 
     model = mujoco.MjModel.from_xml_path(str(scene_path))
+
+    # Restrict contacts to foot-floor only. This disables body/limb contacts
+    # which dramatically reduces constraint count (njmax 161→~32) and prevents
+    # the robot from exploiting body-floor sliding for forward motion.
+    _foot_bodies = {"left_ankle_roll_link", "right_ankle_roll_link"}
+    for i in range(model.ngeom):
+        geom = model.geom(i)
+        if geom.name == "floor":
+            continue
+        bodyid = int(geom.bodyid[0])
+        body_name = model.body(bodyid).name
+        if body_name not in _foot_bodies:
+            model.geom_contype[i] = 0
+            model.geom_conaffinity[i] = 0
+
     data = mujoco.MjData(model)
 
     # Reset to home keyframe (standing pose)
@@ -179,12 +194,106 @@ def set_state(
 
 # ── Parallel rollout (mujoco_warp) ────────────────────────────────────────────
 
-_mjw_model = None
-_mjw_data = None
-_mjw_nworld = 0
-_qpos_buf = None  # on-device trajectory buffer (horizon, nbatch, nq)
-_qvel_buf = None  # on-device trajectory buffer (horizon, nbatch, nv)
-_horizon = 0
+
+class WarpRollout:
+    """Manages mujoco_warp resources for batched parallel rollouts.
+
+    Lazily initializes device model, data, and trajectory buffers on first
+    use. Reuses allocations across calls; only reallocates when batch size
+    or horizon changes.
+    """
+
+    def __init__(self):
+        self._model = None
+        self._data = None
+        self._nworld = 0
+        self._qpos_buf = None
+        self._qvel_buf = None
+        self._horizon = 0
+
+    def _ensure_model(self, model: mujoco.MjModel) -> None:
+        if self._model is None:
+            self._model = mjw.put_model(model)
+
+    def _ensure_data(self, model: mujoco.MjModel, nbatch: int) -> None:
+        if self._data is None or self._nworld != nbatch:
+            self._data = mjw.make_data(model, nworld=nbatch, njmax=80, nconmax=16)
+            self._nworld = nbatch
+
+    def _ensure_buffers(self, horizon: int, nbatch: int, nq: int, nv: int) -> None:
+        if (self._qpos_buf is None
+                or self._horizon != horizon
+                or self._qpos_buf.shape[1] != nbatch):
+            self._qpos_buf = wp.zeros((horizon, nbatch, nq), dtype=wp.float32)
+            self._qvel_buf = wp.zeros((horizon, nbatch, nv), dtype=wp.float32)
+            self._horizon = horizon
+
+    def rollout(
+        self,
+        model: mujoco.MjModel,
+        initial_state: np.ndarray,
+        control_seq: np.ndarray,
+        nstep: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Roll out sampled trajectories in parallel.
+
+        Args:
+            model: MjModel instance (CPU).
+            initial_state: Full physics state from get_initial_state.
+                Layout: [time(1), qpos(nq), qvel(nv), act(na)].
+            control_seq: Control sequences, shape (nbatch, horizon, nu).
+            nstep: Total physics steps (= horizon * control_substeps).
+
+        Returns:
+            qpos_traj: (nbatch, horizon, nq) positions at control rate.
+            qvel_traj: (nbatch, horizon, nv) velocities at control rate.
+        """
+        nbatch, horizon, nu = control_seq.shape
+        control_substeps = nstep // horizon
+        nq, nv = model.nq, model.nv
+
+        self._ensure_model(model)
+        self._ensure_data(model, nbatch)
+        self._ensure_buffers(horizon, nbatch, nq, nv)
+
+        # Set initial state in-place (no allocation)
+        qpos0 = initial_state[1:1 + nq].astype(np.float32)
+        qvel0 = initial_state[1 + nq:1 + nq + nv].astype(np.float32)
+        qpos_init = np.tile(qpos0, (nbatch, 1))
+        qvel_init = np.tile(qvel0, (nbatch, 1))
+
+        self._data.qpos.assign(qpos_init)
+        self._data.qvel.assign(qvel_init)
+        self._data.time.zero_()
+        self._data.qacc.zero_()
+        self._data.ctrl.zero_()
+        mjw.forward(self._model, self._data)
+
+        # Cast control_seq to float32 once, rearrange to (horizon, nbatch, nu)
+        # so each ctrl_f32[t] is a contiguous (nbatch, nu) slice
+        ctrl_f32 = np.ascontiguousarray(
+            control_seq.transpose(1, 0, 2), dtype=np.float32
+        )
+
+        # Rollout: step through horizon, accumulate on device
+        for t in range(horizon):
+            self._data.ctrl.assign(ctrl_f32[t])
+            for _ in range(control_substeps):
+                mjw.step(self._model, self._data)
+            # Copy qpos/qvel into trajectory buffer on device (no host sync)
+            wp.copy(self._qpos_buf, self._data.qpos,
+                    dest_offset=t * nbatch * nq, count=nbatch * nq)
+            wp.copy(self._qvel_buf, self._data.qvel,
+                    dest_offset=t * nbatch * nv, count=nbatch * nv)
+
+        # Single device→host transfer
+        qpos_raw = self._qpos_buf.numpy().reshape(horizon, nbatch, nq)
+        qvel_raw = self._qvel_buf.numpy().reshape(horizon, nbatch, nv)
+        return (qpos_raw.transpose(1, 0, 2).copy(),
+                qvel_raw.transpose(1, 0, 2).copy())
+
+
+_warp_rollout = WarpRollout()
 
 
 def parallel_rollout(
@@ -196,69 +305,8 @@ def parallel_rollout(
     """Roll out sampled trajectories in parallel using mujoco_warp.
 
     Uses GPU acceleration on Linux/NVIDIA, CPU backend on macOS.
-
-    Args:
-        model: MjModel instance (CPU).
-        initial_state: Full physics state from get_initial_state.
-            Layout: [time(1), qpos(nq), qvel(nv), act(na)].
-        control_seq: Control sequences, shape (nbatch, horizon, nu).
-        nstep: Total physics steps (= horizon * control_substeps).
-
-    Returns:
-        qpos_traj: (nbatch, horizon, nq) positions at control rate.
-        qvel_traj: (nbatch, horizon, nv) velocities at control rate.
     """
-    global _mjw_model, _mjw_data, _mjw_nworld, _qpos_buf, _qvel_buf, _horizon
-
-    nbatch, horizon, nu = control_seq.shape
-    control_substeps = nstep // horizon
-    nq, nv = model.nq, model.nv
-
-    # Lazy initialization
-    if _mjw_model is None:
-        _mjw_model = mjw.put_model(model)
-    if _mjw_data is None or _mjw_nworld != nbatch:
-        _mjw_data = mjw.make_data(model, nworld=nbatch, njmax=300, nconmax=60)
-        _mjw_nworld = nbatch
-    if _qpos_buf is None or _horizon != horizon or _qpos_buf.shape[1] != nbatch:
-        _qpos_buf = wp.zeros((horizon, nbatch, nq), dtype=wp.float32)
-        _qvel_buf = wp.zeros((horizon, nbatch, nv), dtype=wp.float32)
-        _horizon = horizon
-
-    # Set initial state in-place (no allocation)
-    qpos0 = initial_state[1:1 + nq].astype(np.float32)
-    qvel0 = initial_state[1 + nq:1 + nq + nv].astype(np.float32)
-    qpos_init = np.tile(qpos0, (nbatch, 1))
-    qvel_init = np.tile(qvel0, (nbatch, 1))
-
-    _mjw_data.qpos.assign(qpos_init)
-    _mjw_data.qvel.assign(qvel_init)
-    _mjw_data.time.zero_()
-    _mjw_data.qacc.zero_()
-    _mjw_data.ctrl.zero_()
-    mjw.forward(_mjw_model, _mjw_data)
-
-    # Cast control_seq to float32 once, rearrange to (horizon, nbatch, nu)
-    # so each ctrl_f32[t] is a contiguous (nbatch, nu) slice
-    ctrl_f32 = np.ascontiguousarray(
-        control_seq.transpose(1, 0, 2), dtype=np.float32
-    )
-
-    # Rollout: step through horizon, accumulate on device
-    for t in range(horizon):
-        _mjw_data.ctrl.assign(ctrl_f32[t])
-        for _ in range(control_substeps):
-            mjw.step(_mjw_model, _mjw_data)
-        # Copy qpos/qvel into trajectory buffer on device (no host sync)
-        wp.copy(_qpos_buf, _mjw_data.qpos,
-                dest_offset=t * nbatch * nq, count=nbatch * nq)
-        wp.copy(_qvel_buf, _mjw_data.qvel,
-                dest_offset=t * nbatch * nv, count=nbatch * nv)
-
-    # Single device→host transfer
-    qpos_raw = _qpos_buf.numpy().reshape(horizon, nbatch, nq)
-    qvel_raw = _qvel_buf.numpy().reshape(horizon, nbatch, nv)
-    return qpos_raw.transpose(1, 0, 2).copy(), qvel_raw.transpose(1, 0, 2).copy()
+    return _warp_rollout.rollout(model, initial_state, control_seq, nstep)
 
 
 # ── Evaluation ─────────────────────────────────────────────────────────────────

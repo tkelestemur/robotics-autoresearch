@@ -201,6 +201,62 @@ def run_visualized(model: mujoco.MjModel, data: mujoco.MjData) -> None:
             time.sleep(0.1)
 
 
+# ── Benchmark ─────────────────────────────────────────────────────────────────
+
+def run_benchmark(model: mujoco.MjModel, data: mujoco.MjData) -> None:
+    """Benchmark parallel_rollout throughput at various sample counts."""
+    import warp as wp
+
+    device = "CUDA" if wp.is_cuda_available() else "CPU"
+    print(f"Device: {wp.get_preferred_device()} ({device})")
+    print(f"Horizon: {HORIZON}, CONTROL_SUBSTEPS: {CONTROL_SUBSTEPS}")
+    print(f"Physics steps per rollout: {HORIZON * CONTROL_SUBSTEPS}")
+    print()
+
+    if model.nkey > 0:
+        mujoco.mj_resetDataKeyframe(model, data, 0)
+    mujoco.mj_forward(model, data)
+    state = get_initial_state(model, data)
+    home = get_home_positions(model)
+    nstep = HORIZON * CONTROL_SUBSTEPS
+
+    sample_counts = [16, 32, 64, 128, 256, 512, 1024]
+    n_iters = 20  # control steps to average over
+
+    print(f"{'samples':>8}  {'rollout_ms':>11}  {'ctrl_hz':>8}  "
+          f"{'steps/s':>10}  {'realtime_x':>10}")
+    print("-" * 62)
+
+    for n_samples in sample_counts:
+        ctrl_seq = np.tile(home, (n_samples, HORIZON, 1))
+        noise = np.random.default_rng(0).standard_normal(ctrl_seq.shape) * NOISE_STD
+        ctrl_seq = np.clip(ctrl_seq + noise, model.actuator_ctrlrange[:, 0],
+                           model.actuator_ctrlrange[:, 1])
+
+        # Warmup (triggers lazy init / JIT for this batch size)
+        parallel_rollout(model, state, ctrl_seq, nstep)
+
+        # Timed runs
+        t0 = time.time()
+        for _ in range(n_iters):
+            parallel_rollout(model, state, ctrl_seq, nstep)
+        elapsed = time.time() - t0
+
+        ms_per_rollout = (elapsed / n_iters) * 1000
+        ctrl_hz = n_iters / elapsed
+        total_steps = n_samples * HORIZON * CONTROL_SUBSTEPS
+        steps_per_sec = (total_steps * n_iters) / elapsed
+        realtime_x = ctrl_hz * CONTROL_DT  # fraction of realtime
+
+        print(f"{n_samples:>8}  {ms_per_rollout:>10.1f}ms  {ctrl_hz:>7.1f}Hz  "
+              f"{steps_per_sec:>10.0f}  {realtime_x:>9.2f}x")
+
+    print()
+    print(f"ctrl_hz = control steps per second (higher = better)")
+    print(f"realtime_x = fraction of realtime "
+          f"(>1.0 means faster than realtime at CONTROL_DT={CONTROL_DT}s)")
+
+
 # ── Main: run evaluation ──────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -211,6 +267,8 @@ if __name__ == "__main__":
                         help="Launch MuJoCo viewer for real-time visualization")
     parser.add_argument("--fast", action="store_true",
                         help="Quick 5s evaluation for screening")
+    parser.add_argument("--benchmark", action="store_true",
+                        help="Benchmark parallel_rollout at various sample counts")
     args = parser.parse_args()
 
     # Reset globals for fresh run
@@ -222,15 +280,17 @@ if __name__ == "__main__":
     model, data = make_sim()
     model.opt.timestep = SIM_DT
 
-    print(f"  horizon={HORIZON}, samples={NUM_SAMPLES}, "
-          f"temperature={TEMPERATURE}, noise_std={NOISE_STD}")
-    print(f"  SIM_DT={SIM_DT}, CONTROL_DT={CONTROL_DT}, "
-          f"CONTROL_SUBSTEPS={CONTROL_SUBSTEPS}")
-
-    if args.viz:
+    if args.benchmark:
+        run_benchmark(model, data)
+    elif args.viz:
         print("Launching viewer...")
         run_visualized(model, data)
     else:
+        print(f"  horizon={HORIZON}, samples={NUM_SAMPLES}, "
+              f"temperature={TEMPERATURE}, noise_std={NOISE_STD}")
+        print(f"  SIM_DT={SIM_DT}, CONTROL_DT={CONTROL_DT}, "
+              f"CONTROL_SUBSTEPS={CONTROL_SUBSTEPS}")
+
         from prepare import evaluate_speed
 
         n_steps = 250 if args.fast else N_CONTROL_STEPS
