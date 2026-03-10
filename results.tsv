@@ -12,3 +12,4 @@ none	8.004	257.0	discard	exp9: NUM_SAMPLES 1024->512 (regression from 9.18)
 pending	11.621	411.3	keep	exp10: NOISE_STD 0.15->0.25 (broader exploration)
 pending	11.832	411.3	keep	exp11: vertical velocity penalty 0.5*vz^2
 pending	13.002	405.2	keep	exp12: one-sided height penalty (only penalize below target)
+none	11.683	418.2	discard	exp13: discount factor 0.96 (regression from 13.00)
