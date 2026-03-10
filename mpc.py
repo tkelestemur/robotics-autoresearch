@@ -73,9 +73,10 @@ def compute_trajectory_costs(
     vx = qvel_traj[:, :, 0]
     speed_cost = -SPEED_WEIGHT * vx
 
-    # Height penalty
+    # Height penalty (one-sided: only penalize below target)
     z = qpos_traj[:, :, 2]
-    height_cost = HEIGHT_WEIGHT * (z - TARGET_HEIGHT) ** 2
+    height_diff = np.minimum(z - TARGET_HEIGHT, 0.0)
+    height_cost = HEIGHT_WEIGHT * height_diff ** 2
 
     # Upright penalty (quaternion w component — 1.0 means perfectly upright)
     qw = qpos_traj[:, :, 3]
