@@ -14,3 +14,4 @@ pending	11.832	411.3	keep	exp11: vertical velocity penalty 0.5*vz^2
 pending	13.002	405.2	keep	exp12: one-sided height penalty (only penalize below target)
 none	11.683	418.2	discard	exp13: discount factor 0.96 (regression from 13.00)
 none	5.541	1118.0	discard	exp14: SPEED_WEIGHT 5->12 (regression, constraint issues)
+none	0	67.3	discard	exp15: SPEED_WEIGHT 5->8 (fast regression, skipped full)
